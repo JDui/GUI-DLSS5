@@ -8,9 +8,11 @@ const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $(
 const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1 });
 function log(message) { console.debug(`[DLSS5] ${message}`); }
 function status(message) { $('status').textContent = message; }
-async function invokePng(cmd, args) { const res = await invoke(cmd, args); const bytes = res instanceof ArrayBuffer ? new Uint8Array(res) : new Uint8Array(res.buffer ?? res); return URL.createObjectURL(new Blob([bytes], { type:'image/png' })); }
+async function invokePng(cmd, args) { const res = await invoke(cmd, args); const bytes = res instanceof Uint8Array ? res : new Uint8Array(res); return URL.createObjectURL(new Blob([bytes], { type:'image/png' })); }
 async function urlToDataUri(url) { const blob = await (await fetch(url)).blob(); return new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(blob); }); }
-function revokeMedia() { if(state.originalUrl)URL.revokeObjectURL(state.originalUrl); if(state.processedUrl)URL.revokeObjectURL(state.processedUrl); state.originalUrl=null; state.processedUrl=null; }
+// 延迟回收：导出/复制会异步加载正在显示的 URL，立即回收会中断在途加载
+function deferRevoke(url) { if(url) setTimeout(() => URL.revokeObjectURL(url), 5000); }
+function revokeMedia() { deferRevoke(state.originalUrl); deferRevoke(state.processedUrl); state.originalUrl=null; state.processedUrl=null; }
 function syncControls(range, number) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(1, +$(number).value || 0)); refresh(); }; }
 syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num'); syncControls('skin','skin-num');
 $('auto-mask').onchange=()=>refresh(); $('ui-correction').onchange=()=>refresh();
@@ -188,8 +190,8 @@ function refresh(fit=false, delay=90) {
         processedUrl=await invokePng('process_image',{path:renderPath,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
       }
       if(request===state.request&&renderPath===state.path) {
-        if(originalUrl){ if(state.originalUrl)URL.revokeObjectURL(state.originalUrl); state.originalUrl=originalUrl; state.loadedFrame=renderFrame; }
-        if(state.processedUrl)URL.revokeObjectURL(state.processedUrl);
+        if(originalUrl){ deferRevoke(state.originalUrl); state.originalUrl=originalUrl; state.loadedFrame=renderFrame; }
+        deferRevoke(state.processedUrl);
         state.processedUrl=processedUrl;
         chooseDisplayed(renderFit);
         status('就绪');
