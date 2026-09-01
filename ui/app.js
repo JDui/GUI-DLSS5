@@ -235,3 +235,18 @@ $('copy').onclick=async()=>{if(!state.path)return;try{await navigator.clipboard.
 document.addEventListener('paste',()=>$('paste').click());
 new ResizeObserver(()=>{if(state.path&&Math.abs(state.zoom-state.fit)<.01)resetFit();updateSplit();}).observe(stage);
 runtimeReady=initializeRuntime();
+
+// 参数悬停说明
+const PARAM_TIPS={
+  style:'整体风格预设，决定神经网络输出的总体倾向。\n默认：标准 DLSS 渲染。\n自然：更贴近原片观感，改动更克制。\n电影：对比与氛围感更强的风格化处理。\n风格 3：额外的实验风格，效果因素材而异。\n建议用 AB 视图对比不同风格。',
+  intensity:'DLSS 效果的整体权重。\n调大：更接近完整的 DLSS 处理效果。\n调小：逐渐向原图回退，0 时基本不处理。\n想在“增强”与“保真”之间折中时优先调它。',
+  tone:'局部色调映射的权重，影响画面各区域自身的明暗与色彩。\n调大：局部明暗层次与色彩变化更充分，画面更通透。\n调小：局部明暗更贴近原片，整体趋于平淡。\n过高可能出现局部明暗跳跃。',
+  struct:'局部边缘与纹理的重建权重。\n调大：边缘更锐利、纹理细节更突出。\n调小：细节表现更接近原片，画面更柔和，噪点感更轻。\n过高可能放大噪点或产生过锐边缘。',
+  skin:'皮肤区域的专用结构权重，独立于全局结构。\n调大：皮肤纹理（毛孔、发丝等）更清晰。\n调小：皮肤更平滑，近似轻度磨皮，过低可能显得不自然。',
+  autoMask:'开关：让网络自动识别应当少处理或不处理的区域\n（如文字、界面、平坦天空等），降低字幕、HUD 被改写的概率。\n关闭时全画面统一处理，效果更均匀，但界面类内容更易受影响。',
+  uiCorrection:'开关：针对画面中的界面元素（字幕、HUD、水印等）\n做修正与保留，减轻神经渲染对这类规则图形的涂抹。\n对不含界面元素的素材基本无影响。'
+};
+const paramTip=document.createElement('div');paramTip.id='param-tip';document.body.appendChild(paramTip);
+function showParamTip(info){const text=PARAM_TIPS[info.dataset.param];if(!text)return;paramTip.textContent=text;paramTip.style.display='block';const r=info.getBoundingClientRect(),tw=paramTip.offsetWidth,th=paramTip.offsetHeight;let x=r.left-tw-10;if(x<8)x=Math.min(window.innerWidth-tw-8,Math.max(8,r.left));const y=Math.max(8,Math.min(window.innerHeight-th-8,r.top+r.height/2-th/2));paramTip.style.left=`${x}px`;paramTip.style.top=`${y}px`;}
+document.addEventListener('mouseover',e=>{const info=e.target.closest('.info');if(info)showParamTip(info);else if(paramTip.style.display==='block')paramTip.style.display='none';});
+document.addEventListener('mouseleave',()=>paramTip.style.display='none');

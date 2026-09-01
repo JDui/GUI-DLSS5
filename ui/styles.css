@@ -6,3 +6,8 @@
 .gpu-name{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px}.gpu-name.unavailable{color:#e0a46b}
 
 .export-progress{display:flex;align-items:center;gap:8px;flex:1;min-width:220px;max-width:420px}.export-progress progress{width:100%;height:10px;accent-color:var(--accent)}.export-progress span{min-width:112px;color:var(--muted);font-size:12px;white-space:nowrap}footer .export-progress[hidden]{display:none}
+
+.param-title{display:flex;align-items:center;gap:5px}
+.info{display:inline-flex;align-items:center;justify-content:center;flex:none;width:15px;height:15px;margin-left:5px;border:1px solid var(--muted);border-radius:50%;color:var(--muted);font:italic 700 11px/14px Georgia,serif;cursor:help;user-select:none}
+.info:hover{border-color:var(--accent);color:var(--accent)}
+#param-tip{position:fixed;z-index:99;display:none;max-width:290px;padding:9px 11px;border:1px solid var(--edge);border-radius:6px;background:#0b1622f5;color:var(--text);font:12px/1.7 "Microsoft YaHei UI",sans-serif;white-space:pre-line;box-shadow:0 6px 18px #000a;pointer-events:none}
