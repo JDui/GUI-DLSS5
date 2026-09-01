@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::{imageops::FilterType, DynamicImage, ImageFormat, RgbaImage};
+use image::{codecs::png::PngEncoder, imageops::FilterType, ExtendedColorType, ImageEncoder, RgbaImage};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use std::os::windows::ffi::OsStrExt;
@@ -9,7 +9,7 @@ use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsStr,
-    io::{Cursor, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
@@ -17,7 +17,7 @@ use std::{
         Mutex,
     },
 };
-use tauri::Manager;
+use tauri::{ipc::Response, Manager};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREVIEW_CACHE_FRAMES: usize = 12;
@@ -652,16 +652,12 @@ fn bake_gif(state: &AppState, source: &str) -> Result<String, String> {
     Ok(destination.to_string_lossy().into_owned())
 }
 
-fn rgba_png(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, String> {
-    let image = RgbaImage::from_raw(width, height, bytes).ok_or("无效的 RGBA 图像")?;
-    let mut out = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image)
-        .write_to(&mut out, ImageFormat::Png)
+fn rgba_png(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(bytes, width, height, ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        STANDARD.encode(out.into_inner())
-    ))
+    Ok(out)
 }
 fn image_data_uri(data: &str) -> Result<RgbaImage, String> {
     let encoded = data.split_once(',').ok_or("无效图片数据")?.1;
@@ -690,7 +686,7 @@ fn process_rgba(
     image: RgbaImage,
     runtime: String,
     settings: RenderSettings,
-) -> Result<String, String> {
+) -> Result<Vec<u8>, String> {
     let (w, h) = image.dimensions();
     let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
     if host.is_none() {
@@ -698,11 +694,9 @@ fn process_rgba(
     }
     let input = image.into_raw();
     let rendered = unsafe {
-        host.as_mut()
-            .unwrap()
-            .render(&state.root, &runtime, &input, w, h, &settings, true)?
+        host.as_mut().unwrap().render(&state.root, &runtime, &input, w, h, &settings, true)?
     };
-    rgba_png(rendered.to_vec(), w, h)
+    rgba_png(rendered, w, h)
 }
 
 #[tauri::command]
@@ -822,12 +816,17 @@ async fn process_image(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
-) -> Result<String, String> {
+) -> Result<Response, String> {
     let image = image::open(&path)
         .map_err(|e| format!("无法读取图片: {e}"))?
         .to_rgba8();
     let _ = app;
-    process_rgba(&state, preview_size(image, max_side), runtime, settings)
+    Ok(Response::new(process_rgba(
+        &state,
+        preview_size(image, max_side),
+        runtime,
+        settings,
+    )?))
 }
 
 #[tauri::command]
@@ -837,13 +836,13 @@ async fn process_image_data(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
-) -> Result<String, String> {
-    process_rgba(
+) -> Result<Response, String> {
+    Ok(Response::new(process_rgba(
         &state,
         preview_size(image_data_uri(&data)?, max_side),
         runtime,
         settings,
-    )
+    )?))
 }
 
 #[tauri::command]
@@ -860,13 +859,13 @@ async fn save_data_png(
 }
 
 #[tauri::command]
-async fn read_image_data(path: String, max_side: u32) -> Result<String, String> {
+async fn read_image_data(path: String, max_side: u32) -> Result<Response, String> {
     let image = image::open(path)
         .map_err(|e| format!("无法读取图片: {e}"))?
         .to_rgba8();
     let image = preview_size(image, max_side);
     let (w, h) = image.dimensions();
-    rgba_png(image.into_raw(), w, h)
+    Ok(Response::new(rgba_png(&image.into_raw(), w, h)?))
 }
 
 #[tauri::command]
@@ -889,9 +888,7 @@ async fn save_png(
         }
         let input = image.into_raw();
         let out = unsafe {
-            host.as_mut()
-                .unwrap()
-                .render(&state.root, &runtime, &input, w, h, &settings, true)?
+            host.as_mut().unwrap().render(&state.root, &runtime, &input, w, h, &settings, true)?
         };
         RgbaImage::from_raw(w, h, out.to_vec())
             .ok_or("无效输出")?
@@ -903,40 +900,37 @@ async fn save_png(
     result
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoFramePreview {
-    original: String,
-    processed: String,
+#[tauri::command]
+async fn frame_png(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    frame: u32,
+    max_side: u32,
+) -> Result<Response, String> {
+    let (bytes, w, h) = decode_video_frame(&state, &path, frame, max_side)?;
+    Ok(Response::new(rgba_png(&bytes, w, h)?))
 }
 
 #[tauri::command]
-async fn preview_video_frame(
+async fn render_frame_png(
     state: tauri::State<'_, AppState>,
     path: String,
     frame: u32,
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
-) -> Result<VideoFramePreview, String> {
+) -> Result<Response, String> {
     let (bytes, w, h) = decode_video_frame(&state, &path, frame, max_side)?;
-    let image = RgbaImage::from_raw(w, h, bytes).ok_or("无效视频帧")?;
-    let original = rgba_png(image.clone().into_raw(), w, h)?;
-    let (w, h) = image.dimensions();
     let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
     if host.is_none() {
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
     }
-    let bytes = image.into_raw();
     let rendered = unsafe {
         host.as_mut()
             .unwrap()
             .render(&state.root, &runtime, &bytes, w, h, &settings, true)?
     };
-    Ok(VideoFramePreview {
-        original,
-        processed: rgba_png(rendered.to_vec(), w, h)?,
-    })
+    Ok(Response::new(rgba_png(rendered, w, h)?))
 }
 
 // 预检 NVENC 会话是否可用（驱动/并发限制），失败则回退 CPU 编码
@@ -1237,7 +1231,8 @@ fn main() {
             process_image_data,
             save_png,
             save_data_png,
-            preview_video_frame,
+            frame_png,
+            render_frame_png,
             export_video
         ])
         .run(tauri::generate_context!())
