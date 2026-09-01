@@ -1,5 +1,11 @@
 /__pycache__/
 /src-tauri/target/
-/dlss_run.log
 /dist/
 /Temp/
+/dlss5-tauri.exe
+*.log
+*.obj
+*.exp
+*.lib
+/tools/
+/vsr_host/vsr_host_test.exe

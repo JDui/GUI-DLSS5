@@ -5,7 +5,8 @@ let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, sourceData:null, originalUrl:null, processedUrl:null, loadedFrame:-1, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
 const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
-const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1 });
+const settings = () => ({ style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
+const upscaleArgs = () => ({ upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value });
 function log(message) { console.debug(`[DLSS5] ${message}`); }
 function status(message) { $('status').textContent = message; }
 async function invokePng(cmd, args) { const res = await invoke(cmd, args); const bytes = res instanceof Uint8Array ? res : new Uint8Array(res); return URL.createObjectURL(new Blob([bytes], { type:'image/png' })); }
@@ -16,6 +17,51 @@ function revokeMedia() { deferRevoke(state.originalUrl); deferRevoke(state.proce
 function syncControls(range, number) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(1, +$(number).value || 0)); refresh(); }; }
 syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num'); syncControls('skin','skin-num');
 $('auto-mask').onchange=()=>refresh(); $('ui-correction').onchange=()=>refresh();
+// 输出尺寸：自定义长宽 + X1/X2/X4 快速倍率；32..8192 且取偶（视频编码要求）
+// 放大功能整体依赖 RTX VSR：关闭或不可用时输出不能超过原始分辨率
+const OUTPUT_MIN_SIDE=32, OUTPUT_MAX_SIDE=8192;
+function vsrEnabled(){ const option=$('upscale').querySelector('option[value=vsr]'); return $('upscale').value==='vsr'&&option&&!option.disabled; }
+function outputCap(){ if(vsrEnabled())return{w:OUTPUT_MAX_SIDE,h:OUTPUT_MAX_SIDE}; const s=sourceSize(); return s?{w:s[0],h:s[1]}:{w:OUTPUT_MAX_SIDE,h:OUTPUT_MAX_SIDE}; }
+function fitOutput(w,h) {
+  let x=Math.round(+w), y=Math.round(+h);
+  if(!(x>0)||!(y>0))return null;
+  const cap=outputCap();
+  let s=Math.min(1,cap.w/x,cap.h/y);
+  s=Math.max(s,OUTPUT_MIN_SIDE/x,OUTPUT_MIN_SIDE/y);
+  x=Math.round(Math.min(cap.w,Math.max(OUTPUT_MIN_SIDE,x*s)));
+  y=Math.round(Math.min(cap.h,Math.max(OUTPUT_MIN_SIDE,y*s)));
+  return [x-(x%2),y-(y%2)];
+}
+function outputSize() { if(!state.path)return null; return fitOutput($('out-width').value,$('out-height').value); }
+function outputArgs() { const s=outputSize(); return {outputWidth:s?s[0]:null,outputHeight:s?s[1]:null}; }
+function sourceSize() { const w=state.info?.width||originalPreview.naturalWidth||preview.naturalWidth, h=state.info?.height||originalPreview.naturalHeight||preview.naturalHeight; return w&&h?[w,h]:null; }
+function markRatio() { const base=sourceSize(),w=+$('out-width').value,h=+$('out-height').value; [['ratio-1',1],['ratio-2',2],['ratio-4',4]].forEach(([id,k])=>{ const t=base?fitOutput(base[0]*k,base[1]*k):null; $(id).classList.toggle('active',!!t&&t[0]===w&&t[1]===h); }); }
+function syncOutputInputs() { const s=outputSize(); if(s){$('out-width').value=s[0];$('out-height').value=s[1];} markRatio(); }
+function updateSizeNote() { const s=sourceSize(), el=$('size-note'); if(el) el.textContent=s?`原始 ${s[0]}×${s[1]}`:''; }
+function setRatio(k) { if(!vsrEnabled())return; const base=sourceSize(); if(!base)return; const t=fitOutput(base[0]*k,base[1]*k); if(!t)return; $('out-width').value=t[0]; $('out-height').value=t[1]; markRatio(); refresh(true); }
+$('ratio-1').onclick=()=>setRatio(1); $('ratio-2').onclick=()=>setRatio(2); $('ratio-4').onclick=()=>setRatio(4);
+$('out-width').onchange=$('out-height').onchange=()=>{syncOutputInputs();refresh(true);};
+function updateUpscaleAvailability(){
+  const on=vsrEnabled(), cap=outputCap();
+  $('ratio-2').disabled=!on; $('ratio-4').disabled=!on;
+  $('ratio-2').title=on?'按原始尺寸的 2 倍输出':'放大功能需要 RTX VSR';
+  $('ratio-4').title=on?'按原始尺寸的 4 倍输出':'放大功能需要 RTX VSR';
+  $('out-width').max=cap.w; $('out-height').max=cap.h;
+}
+$('upscale').onchange=()=>{updateUpscaleAvailability();syncOutputInputs();updateSizeNote();refresh(true);};
+$('vsr-quality').onchange=()=>refresh();
+document.querySelectorAll('.tabs .tab').forEach(button=>button.onclick=()=>{
+  document.querySelectorAll('.tabs .tab').forEach(item=>item.classList.toggle('active',item===button));
+  document.querySelectorAll('.tab-page').forEach(page=>page.hidden=page.id!=='tab-'+button.dataset.tab);
+});
+invoke('vsr_probe').then(available=>{if(!available)markVsrUnavailable();}).catch(()=>markVsrUnavailable());
+function markVsrUnavailable(){
+  const option=$('upscale').querySelector('option[value=vsr]');
+  option.disabled=true;option.textContent='RTX VSR（不可用）';
+  if($('upscale').value==='vsr')$('upscale').value='none';
+  updateUpscaleAvailability();syncOutputInputs();updateSizeNote();refresh(true);
+}
+updateUpscaleAvailability();
 function syncAbLayout() {
   const original = abOriginal, processed = abProcessed;
   const w = original.naturalWidth || processed.naturalWidth || 1;
@@ -95,12 +141,14 @@ async function loadPath(path) {
   refreshQueued=false;
   refreshQueuedFit=false;
   const info=await invoke('media_info',{path}); revokeMedia(); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,sourceData:null,splitX:null,loadedFrame:-1});
+  const initial=fitOutput(info.width,info.height)||[info.width,info.height];
+  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote();
   if(info.kind==='video') {
     status('正在生成首帧预览…');
-    state.originalUrl=await invokePng('frame_png',{path:info.path,frame:0,maxSide:PREVIEW_MAX_SIDE});
+    state.originalUrl=await invokePng('frame_png',{path:info.path,frame:0,maxSide:PREVIEW_MAX_SIDE,...outputArgs(),...upscaleArgs()});
     state.loadedFrame=0;
   } else {
-    state.originalUrl=await invokePng('read_image_data',{path:info.path,maxSide:PREVIEW_MAX_SIDE});
+    state.originalUrl=await invokePng('read_image_data',{path:info.path,maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
   }
   $('source').textContent=`${path.split(/[\\/]/).pop()} · ${info.kind==='video'?'视频':'图片'} · ${info.width}×${info.height}`; $('frame').max=Math.max(0,info.frames-1); $('frame').value=0; $('frame-label').textContent=`帧 0 / ${Math.max(0,info.frames-1)}`; $('export-full').textContent=info.kind==='video'?'导出 DLSS 视频':'导出 DLSS 图片';
   chooseDisplayed(true);
@@ -182,12 +230,12 @@ function refresh(fit=false, delay=90) {
       status('正在刷新轻量预览…');
       let processedUrl, originalUrl;
       if(renderKind==='video') {
-        processedUrl=await invokePng('render_frame_png',{path:renderPath,frame:renderFrame,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
-        if(renderFrame!==state.loadedFrame) originalUrl=await invokePng('frame_png',{path:renderPath,frame:renderFrame,maxSide:PREVIEW_MAX_SIDE});
+        processedUrl=await invokePng('render_frame_png',{path:renderPath,frame:renderFrame,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
+        if(renderFrame!==state.loadedFrame) originalUrl=await invokePng('frame_png',{path:renderPath,frame:renderFrame,maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
       } else if(renderKind==='clipboard') {
-        processedUrl=await invokePng('process_image_data',{data:state.sourceData,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
+        processedUrl=await invokePng('process_image_data',{data:state.sourceData,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
       } else {
-        processedUrl=await invokePng('process_image',{path:renderPath,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE});
+        processedUrl=await invokePng('process_image',{path:renderPath,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
       }
       if(request===state.request&&renderPath===state.path) {
         if(originalUrl){ deferRevoke(state.originalUrl); state.originalUrl=originalUrl; state.loadedFrame=renderFrame; }
@@ -213,7 +261,7 @@ function refresh(fit=false, delay=90) {
   },delay));
 }
 $('open').onclick=async()=>{try{const path=await invoke('choose_media');if(path)await loadPath(path);}catch(e){log(String(e));status('导入失败');}};
-$('paste').onclick=async()=>{try{const item=(await navigator.clipboard.read()).find(i=>i.types.some(t=>t.startsWith('image/')));if(!item)throw Error('剪贴板中没有图片');const type=item.types.find(t=>t.startsWith('image/'));const blob=await item.getType(type),reader=new FileReader();reader.onload=async()=>{const scaled=await scaleClipboard(reader.result);revokeMedia();Object.assign(state,{path:'剪贴板图片',kind:'clipboard',info:{kind:'image',frames:1},sourceData:scaled,originalUrl:URL.createObjectURL(await (await fetch(scaled)).blob()),splitX:null,loadedFrame:-1});$('source').textContent='已粘贴图片（轻量预览）';await refresh(true);};reader.readAsDataURL(blob);}catch(e){log(`粘贴: ${e}`);status('粘贴失败');}};
+$('paste').onclick=async()=>{try{const item=(await navigator.clipboard.read()).find(i=>i.types.some(t=>t.startsWith('image/')));if(!item)throw Error('剪贴板中没有图片');const type=item.types.find(t=>t.startsWith('image/'));const blob=await item.getType(type),reader=new FileReader();reader.onload=async()=>{const scaled=await scaleClipboard(reader.result);const pasted=await loadDataImage(scaled);revokeMedia();Object.assign(state,{path:'剪贴板图片',kind:'clipboard',info:{kind:'image',frames:1,width:pasted.naturalWidth,height:pasted.naturalHeight},sourceData:scaled,originalUrl:URL.createObjectURL(await (await fetch(scaled)).blob()),splitX:null,loadedFrame:-1});$('out-width').value=pasted.naturalWidth;$('out-height').value=pasted.naturalHeight;markRatio();updateSizeNote();$('source').textContent='已粘贴图片（轻量预览）';await refresh(true);};reader.readAsDataURL(blob);}catch(e){log(`粘贴: ${e}`);status('粘贴失败');}};
 $('view').onchange=()=>chooseDisplayed(true); $('ab-layout').onchange=()=>chooseDisplayed(true); $('style').onchange=()=>refresh(); $('runtime').onchange=()=>{log('运行时变更需重启应用后生效。');refresh();};
   $('zoom').onclick=()=>{if(!state.path)return;if(Math.abs(state.zoom-1)<.01)resetFit();else{const [w,h]=displayedSize(),viewport=activeViewport();state.zoom=1;state.panX=(viewport.clientWidth-w)/2;state.panY=(viewport.clientHeight-h)/2;transform();}};
  function stagePoint(event) { const rect=stage.getBoundingClientRect(); return {x:Math.max(0,Math.min(stage.clientWidth,event.clientX-rect.left)),y:Math.max(0,Math.min(stage.clientHeight,event.clientY-rect.top))}; }
@@ -232,7 +280,7 @@ function playbackTick(now){
 $('frame').oninput=async event=>{if(event.isTrusted)stopPlayback();$('frame-label').textContent=`帧 ${$('frame').value} / ${$('frame').max}`;await refresh(false,40);};
 $('play').onclick=()=>{if(!state.info||state.kind!=='video')return;if(playHandle!==null){stopPlayback();return;}playStartedAt=performance.now();playStartedFrame=+$('frame').value;$('play').textContent='⏸ 暂停';playHandle=requestAnimationFrame(playbackTick);};
 $('export-current').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:false});if(!destination)return;await runExport(1,async()=>invoke('save_data_png',{data:await currentImageData(),destination}));log(`已导出当前画面: ${destination}`);status('当前画面已导出');}catch(e){log(`当前画面导出失败: ${e}`);status('导出失败');}};
-$('export-full').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:state.kind==='video'});if(!destination)return;const total=state.kind==='video'?Math.max(1,state.info?.frames||1):1;await runExport(total,async()=>{status('正在按原始分辨率导出…');if(state.kind==='video'){const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:await urlToDataUri(state.processedUrl||state.originalUrl),destination});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings()});log(`已导出: ${destination}`);}});status('导出完成');}catch(e){log(`导出失败: ${e}`);status('导出失败');}};
+$('export-full').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:state.kind==='video'});if(!destination)return;const total=state.kind==='video'?Math.max(1,state.info?.frames||1):1;await runExport(total,async()=>{const size=outputSize();status(size?`正在按 ${size[0]}×${size[1]} 导出…`:'正在按原始分辨率导出…');if(state.kind==='video'){const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings(),...outputArgs()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:await urlToDataUri(state.processedUrl||state.originalUrl),destination,...outputArgs(),...upscaleArgs()});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings(),...outputArgs()});log(`已导出: ${destination}`);}});status('导出完成');}catch(e){log(`导出失败: ${e}`);status('导出失败');}};
 $('copy').onclick=async()=>{if(!state.path)return;try{await navigator.clipboard.write([new ClipboardItem({'image/png':await(await fetch(await currentImageData())).blob()})]);status('当前画面已复制');}catch(e){log(`复制失败: ${e}`);}};
 document.addEventListener('paste',()=>$('paste').click());
 new ResizeObserver(()=>{if(state.path&&Math.abs(state.zoom-state.fit)<.01)resetFit();updateSplit();}).observe(stage);

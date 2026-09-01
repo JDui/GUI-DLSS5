@@ -44,6 +44,11 @@ struct RenderSettings {
     ui_correction: bool,
     output_view: i32,
     output_mix: f32,
+    upscale: String,
+    vsr_quality: i32,
+    encoder: String,
+    encoder_quality: i32,
+    keep_audio: bool,
 }
 
 impl Default for RenderSettings {
@@ -58,6 +63,11 @@ impl Default for RenderSettings {
             ui_correction: false,
             output_view: 0,
             output_mix: 1.0,
+            upscale: "vsr".into(),
+            vsr_quality: 4,
+            encoder: "h264_nvenc".into(),
+            encoder_quality: 23,
+            keep_audio: true,
         }
     }
 }
@@ -252,10 +262,78 @@ impl Drop for Host {
     }
 }
 
+// RTX VSR（RTX Video SDK，NGX Feature 16）：真正的网络超分，用于放大步骤
+type VsInitFn = unsafe extern "C" fn(*const u16) -> i32;
+type VsUpscaleFn = unsafe extern "C" fn(*const u8, i32, i32, *mut u8, i32, i32, i32) -> i32;
+type VsShutdownFn = unsafe extern "C" fn();
+
+struct VsrHost {
+    _library: Library,
+    upscale: VsUpscaleFn,
+    shutdown: VsShutdownFn,
+}
+
+impl VsrHost {
+    unsafe fn open(root: &Path) -> Result<Self, String> {
+        let library = Library::new(root.join("rtx_vsr_host.dll"))
+            .map_err(|e| format!("无法加载 rtx_vsr_host.dll: {e}"))?;
+        let init = *library
+            .get::<VsInitFn>(b"vsr_init\0")
+            .map_err(|e| e.to_string())?;
+        let upscale = *library
+            .get::<VsUpscaleFn>(b"vsr_upscale\0")
+            .map_err(|e| e.to_string())?;
+        let shutdown = *library
+            .get::<VsShutdownFn>(b"vsr_shutdown\0")
+            .map_err(|e| e.to_string())?;
+        let dir = wide(root);
+        if init(dir.as_ptr()) == 0 {
+            return Err(
+                "RTX VSR 不可用：需要 RTX 20 系及以上显卡与 550+ 驱动，且 nvngx_vsr.dll 完整。".into(),
+            );
+        }
+        Ok(Self {
+            _library: library,
+            upscale,
+            shutdown,
+        })
+    }
+
+    unsafe fn upscale(&self, image: &RgbaImage, tw: u32, th: u32, quality: i32) -> Option<RgbaImage> {
+        let (w, h) = image.dimensions();
+        let input = image.as_raw();
+        let mut out = vec![0_u8; (tw as usize) * (th as usize) * 4];
+        if (self.upscale)(
+            input.as_ptr(),
+            w as i32,
+            h as i32,
+            out.as_mut_ptr(),
+            tw as i32,
+            th as i32,
+            quality,
+        ) == 1
+        {
+            RgbaImage::from_raw(tw, th, out)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for VsrHost {
+    fn drop(&mut self) {
+        unsafe {
+            (self.shutdown)();
+        }
+    }
+}
+
 struct AppState {
     root: PathBuf,
     temp_dir: PathBuf,
     host: Mutex<Option<Host>>,
+    vsr: Mutex<Option<VsrHost>>,
+    vsr_disabled: AtomicBool,
     media: Mutex<HashMap<String, MediaInfo>>,
     decoder: Mutex<Option<VideoDecoder>>,
     temp_counter: AtomicU64,
@@ -490,12 +568,134 @@ fn preview_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u32) {
     }
 }
 
+// 输出尺寸约束：32..=8192 且取偶（视频 yuv420p 编码要求），越界时按比例整体缩放
+fn sanitize_output(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+    let (width, height) = (width?, height?);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (wf, hf) = (f64::from(width), f64::from(height));
+    let scale = 1.0f64
+        .min(8192.0 / wf)
+        .min(8192.0 / hf)
+        .max(32.0 / wf)
+        .max(32.0 / hf);
+    let w = ((wf * scale).round() as u32).clamp(32, 8192);
+    let h = ((hf * scale).round() as u32).clamp(32, 8192);
+    Some((w & !1, h & !1))
+}
+
+// DLSS 侧预览帧：纯放大且启用 RTX VSR 时走 GPU 网络超分；
+// 放大功能仅在 VSR 可用时开放，未启用 VSR 的放大请求保持在源分辨率
+fn prepare_preview(
+    state: &AppState,
+    image: RgbaImage,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+    vsr: bool,
+    quality: i32,
+) -> RgbaImage {
+    let (tw, th) = target
+        .map(|(w, h)| preview_dimensions(w, h, max_side))
+        .unwrap_or_else(|| {
+            let (w, h) = image.dimensions();
+            preview_dimensions(w, h, max_side)
+        });
+    let (w, h) = image.dimensions();
+    if (tw, th) == (w, h) {
+        return image;
+    }
+    if tw > w && th > h {
+        return if vsr {
+            upscale_frame(state, image, (tw, th), quality)
+        } else {
+            image
+        };
+    }
+    image::imageops::resize(&image, tw, th, FilterType::CatmullRom)
+}
+
+// 原图侧预览帧：放大使用最近邻（诚实的像素放大，不添加任何信息），缩小用 CatmullRom
+fn preview_original(image: RgbaImage, max_side: u32, target: Option<(u32, u32)>) -> RgbaImage {
+    let (tw, th) = target
+        .map(|(w, h)| preview_dimensions(w, h, max_side))
+        .unwrap_or_else(|| {
+            let (w, h) = image.dimensions();
+            preview_dimensions(w, h, max_side)
+        });
+    let (w, h) = image.dimensions();
+    if (tw, th) == (w, h) {
+        return image;
+    }
+    if tw > w && th > h {
+        image::imageops::resize(&image, tw, th, FilterType::Nearest)
+    } else {
+        image::imageops::resize(&image, tw, th, FilterType::CatmullRom)
+    }
+}
+
+// 放大到目标尺寸：RTX VSR 推理失败时回退最近邻（放大功能依赖 VSR，不再提供 CPU 放大）
+fn upscale_frame(state: &AppState, image: RgbaImage, target: (u32, u32), quality: i32) -> RgbaImage {
+    let (tw, th) = target;
+    let (w, h) = image.dimensions();
+    if (tw, th) == (w, h) {
+        return image;
+    }
+    if !state.vsr_disabled.load(Ordering::Acquire) {
+        if let Ok(mut slot) = state.vsr.lock() {
+            if slot.is_none() {
+                match unsafe { VsrHost::open(&state.root) } {
+                    Ok(host) => *slot = Some(host),
+                    Err(error) => {
+                        state.vsr_disabled.store(true, Ordering::Release);
+                        eprintln!("[DLSS5] {error}");
+                    }
+                }
+            }
+            if let Some(host) = slot.as_ref() {
+                if let Some(upscaled) = unsafe { host.upscale(&image, tw, th, quality) } {
+                    return upscaled;
+                }
+                eprintln!("[DLSS5] RTX VSR 放大失败，本次回退最近邻");
+            }
+        }
+    }
+    image::imageops::resize(&image, tw, th, FilterType::Nearest)
+}
+
+// 导出用重采样：纯放大仅在启用 RTX VSR 时走 GPU，缩小用 Lanczos3；
+// 未启用 VSR 的放大请求保持在源分辨率（放大功能整体依赖 RTX VSR）
+fn resize_to_target(
+    state: &AppState,
+    image: RgbaImage,
+    target: Option<(u32, u32)>,
+    vsr: bool,
+    quality: i32,
+) -> RgbaImage {
+    let (w, h) = image.dimensions();
+    match target {
+        Some((tw, th)) if (tw, th) != (w, h) => {
+            if tw > w && th > h {
+                if vsr {
+                    upscale_frame(state, image, (tw, th), quality)
+                } else {
+                    image
+                }
+            } else {
+                image::imageops::resize(&image, tw, th, FilterType::Lanczos3)
+            }
+        }
+        _ => image,
+    }
+}
+
 fn spawn_decoder(
     info: &MediaInfo,
+    width: u32,
+    height: u32,
     max_side: u32,
     start_frame: u32,
 ) -> Result<VideoDecoder, String> {
-    let (width, height) = preview_dimensions(info.width, info.height, max_side);
     let mut command = tool("ffmpeg")?;
     command.args(["-v", "error"]);
     if start_frame > 0 {
@@ -540,6 +740,8 @@ fn decode_video_frame(
     path: &str,
     frame: u32,
     max_side: u32,
+    target: Option<(u32, u32)>,
+    vsr_mode: bool,
 ) -> Result<(Vec<u8>, u32, u32), String> {
     let info = state
         .media
@@ -562,10 +764,23 @@ fn decode_video_frame(
         })
         .ok_or("无法读取视频信息")?;
     let frame = frame.min(info.frames.saturating_sub(1));
+    let (pw, ph) = target
+        .map(|(w, h)| preview_dimensions(w, h, max_side))
+        .unwrap_or_else(|| preview_dimensions(info.width, info.height, max_side));
+    // VSR 模式且预览目标大于源时，解码保持原始分辨率，把放大交给 GPU
+    let bypass = vsr_mode && pw > info.width && ph > info.height;
+    let (target_w, target_h) = if bypass {
+        (info.width, info.height)
+    } else {
+        (pw, ph)
+    };
     let mut slot = state.decoder.lock().map_err(|_| "视频解码器锁定失败")?;
-    let reusable = slot
-        .as_ref()
-        .is_some_and(|decoder| decoder.path == path && decoder.max_side == max_side);
+    let reusable = slot.as_ref().is_some_and(|decoder| {
+        decoder.path == path
+            && decoder.max_side == max_side
+            && decoder.width == target_w
+            && decoder.height == target_h
+    });
     if !reusable {
         drop(slot.take());
     }
@@ -587,7 +802,7 @@ fn decode_video_frame(
         } else {
             0
         };
-        *slot = Some(spawn_decoder(&info, max_side, start_frame)?);
+        *slot = Some(spawn_decoder(&info, target_w, target_h, max_side, start_frame)?);
     }
     let decoder = slot.as_mut().unwrap();
     let frame_bytes = (decoder.width * decoder.height * 4) as usize;
@@ -666,27 +881,22 @@ fn image_data_uri(data: &str) -> Result<RgbaImage, String> {
         .map_err(|e| e.to_string())?
         .to_rgba8())
 }
-fn preview_size(image: RgbaImage, max_side: u32) -> RgbaImage {
-    let max_side = max_side.clamp(320, MAX_PREVIEW_SIDE);
-    let (w, h) = image.dimensions();
-    if w.max(h) <= max_side {
-        image
-    } else {
-        let scale = max_side as f32 / w.max(h) as f32;
-        image::imageops::resize(
-            &image,
-            (w as f32 * scale).round().max(1.0) as u32,
-            (h as f32 * scale).round().max(1.0) as u32,
-            FilterType::Triangle,
-        )
-    }
-}
 fn process_rgba(
     state: &AppState,
     image: RgbaImage,
     runtime: String,
     settings: RenderSettings,
+    max_side: u32,
+    target: Option<(u32, u32)>,
 ) -> Result<Vec<u8>, String> {
+    let image = prepare_preview(
+        state,
+        image,
+        max_side,
+        target,
+        settings.upscale == "vsr",
+        settings.vsr_quality,
+    );
     let (w, h) = image.dimensions();
     let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
     if host.is_none() {
@@ -733,6 +943,25 @@ fn choose_export(video: bool) -> Option<String> {
 #[tauri::command]
 fn gpu_info(state: tauri::State<'_, AppState>) -> GpuInfo {
     state.gpu.clone()
+}
+
+// 探测 RTX VSR 是否可用；成功时宿主保持已创建状态供后续放大调用
+#[tauri::command]
+fn vsr_probe(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    if state.vsr_disabled.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    let mut slot = state.vsr.lock().map_err(|_| "VSR 会话锁定失败")?;
+    if slot.is_none() {
+        match unsafe { VsrHost::open(&state.root) } {
+            Ok(host) => *slot = Some(host),
+            Err(error) => {
+                state.vsr_disabled.store(true, Ordering::Release);
+                return Err(error);
+            }
+        }
+    }
+    Ok(slot.is_some())
 }
 
 #[tauri::command]
@@ -816,6 +1045,8 @@ async fn process_image(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
 ) -> Result<Response, String> {
     let image = image::open(&path)
         .map_err(|e| format!("无法读取图片: {e}"))?
@@ -823,9 +1054,11 @@ async fn process_image(
     let _ = app;
     Ok(Response::new(process_rgba(
         &state,
-        preview_size(image, max_side),
+        image,
         runtime,
         settings,
+        max_side,
+        sanitize_output(output_width, output_height),
     )?))
 }
 
@@ -836,12 +1069,16 @@ async fn process_image_data(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
 ) -> Result<Response, String> {
     Ok(Response::new(process_rgba(
         &state,
-        preview_size(image_data_uri(&data)?, max_side),
+        image_data_uri(&data)?,
         runtime,
         settings,
+        max_side,
+        sanitize_output(output_width, output_height),
     )?))
 }
 
@@ -850,20 +1087,33 @@ async fn save_data_png(
     state: tauri::State<'_, AppState>,
     data: String,
     destination: String,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+    upscale: Option<String>,
+    vsr_quality: Option<i32>,
 ) -> Result<(), String> {
     begin_export_progress(&state, 1)?;
-    let result =
-        image_data_uri(&data).and_then(|image| image.save(destination).map_err(|e| e.to_string()));
+    let vsr = upscale.as_deref() == Some("vsr");
+    let quality = vsr_quality.unwrap_or(4);
+    let result = image_data_uri(&data).and_then(|image| {
+        let image = resize_to_target(&state, image, sanitize_output(output_width, output_height), vsr, quality);
+        image.save(&destination).map_err(|e| e.to_string())
+    });
     finish_export_progress(&state, &result, u32::from(result.is_ok()));
     result
 }
 
 #[tauri::command]
-async fn read_image_data(path: String, max_side: u32) -> Result<Response, String> {
+async fn read_image_data(
+    path: String,
+    max_side: u32,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+) -> Result<Response, String> {
     let image = image::open(path)
         .map_err(|e| format!("无法读取图片: {e}"))?
         .to_rgba8();
-    let image = preview_size(image, max_side);
+    let image = preview_original(image, max_side, sanitize_output(output_width, output_height));
     let (w, h) = image.dimensions();
     Ok(Response::new(rgba_png(&image.into_raw(), w, h)?))
 }
@@ -875,12 +1125,21 @@ async fn save_png(
     destination: String,
     runtime: String,
     settings: RenderSettings,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
 ) -> Result<(), String> {
     begin_export_progress(&state, 1)?;
     let result: Result<(), String> = (|| {
         let image = image::open(&path)
             .map_err(|e| format!("无法读取图片: {e}"))?
             .to_rgba8();
+        let image = resize_to_target(
+            &state,
+            image,
+            sanitize_output(output_width, output_height),
+            settings.upscale == "vsr",
+            settings.vsr_quality,
+        );
         let (w, h) = image.dimensions();
         let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
         if host.is_none() {
@@ -900,15 +1159,59 @@ async fn save_png(
     result
 }
 
+// 解码后按需把帧升到预览目标尺寸：原图侧（nearest）用最近邻，DLSS 侧走 RTX VSR；
+// 两种模式在放大时都让解码保持源分辨率
+#[allow(clippy::too_many_arguments)]
+fn decoded_preview_frame(
+    state: &AppState,
+    path: &str,
+    frame: u32,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+    vsr: bool,
+    nearest: bool,
+    quality: i32,
+) -> Result<RgbaImage, String> {
+    let (bytes, dw, dh) = decode_video_frame(&state, path, frame, max_side, target, vsr || nearest)?;
+    let image = RgbaImage::from_raw(dw, dh, bytes).ok_or("无效视频帧")?;
+    let (pw, ph) = target
+        .map(|(w, h)| preview_dimensions(w, h, max_side))
+        .unwrap_or((dw, dh));
+    if (dw, dh) == (pw, ph) {
+        return Ok(image);
+    }
+    if pw > dw && ph > dh {
+        if nearest {
+            Ok(image::imageops::resize(&image, pw, ph, FilterType::Nearest))
+        } else {
+            Ok(upscale_frame(state, image, (pw, ph), quality))
+        }
+    } else {
+        Ok(image::imageops::resize(&image, pw, ph, FilterType::CatmullRom))
+    }
+}
+
 #[tauri::command]
 async fn frame_png(
     state: tauri::State<'_, AppState>,
     path: String,
     frame: u32,
     max_side: u32,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
 ) -> Result<Response, String> {
-    let (bytes, w, h) = decode_video_frame(&state, &path, frame, max_side)?;
-    Ok(Response::new(rgba_png(&bytes, w, h)?))
+    let image = decoded_preview_frame(
+        &state,
+        &path,
+        frame,
+        max_side,
+        sanitize_output(output_width, output_height),
+        false,
+        true,
+        0,
+    )?;
+    let (w, h) = image.dimensions();
+    Ok(Response::new(rgba_png(&image.into_raw(), w, h)?))
 }
 
 #[tauri::command]
@@ -919,8 +1222,20 @@ async fn render_frame_png(
     runtime: String,
     settings: RenderSettings,
     max_side: u32,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
 ) -> Result<Response, String> {
-    let (bytes, w, h) = decode_video_frame(&state, &path, frame, max_side)?;
+    let image = decoded_preview_frame(
+        &state,
+        &path,
+        frame,
+        max_side,
+        sanitize_output(output_width, output_height),
+        settings.upscale == "vsr",
+        false,
+        settings.vsr_quality,
+    )?;
+    let (w, h) = image.dimensions();
     let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
     if host.is_none() {
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
@@ -928,13 +1243,25 @@ async fn render_frame_png(
     let rendered = unsafe {
         host.as_mut()
             .unwrap()
-            .render(&state.root, &runtime, &bytes, w, h, &settings, true)?
+            .render(&state.root, &runtime, &image.into_raw(), w, h, &settings, true)?
     };
     Ok(Response::new(rgba_png(rendered, w, h)?))
 }
 
-// 预检 NVENC 会话是否可用（驱动/并发限制），失败则回退 CPU 编码
-fn nvenc_available() -> bool {
+// ffmpeg stderr 留尾：去掉空字节，最多保留末尾 400 字符
+fn recent_text(mut bytes: Vec<u8>) -> String {
+    bytes.retain(|b| *b != 0);
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    let total = text.chars().count();
+    if total > 400 {
+        format!("…{}", text.chars().skip(total - 400).collect::<String>())
+    } else {
+        text
+    }
+}
+
+// 预检 NVENC 编码器是否可用（驱动/并发限制），失败时调用方回退 CPU 编码
+fn nvenc_available(encoder: &str) -> bool {
     let Ok(mut command) = tool("ffmpeg") else {
         return false;
     };
@@ -950,7 +1277,7 @@ fn nvenc_available() -> bool {
             "-frames:v",
             "5",
             "-c:v",
-            "h264_nvenc",
+            encoder,
             "-preset",
             "p5",
             "-rc",
@@ -971,6 +1298,28 @@ fn nvenc_available() -> bool {
         .unwrap_or(false)
 }
 
+// 解析编码器设置：NVENC 不可用时回退对应的 CPU 编码器，返回 (ffmpeg 编码器名, 是否硬件)
+fn resolve_encoder(requested: &str) -> (&'static str, bool) {
+    match requested {
+        "h265_nvenc" => {
+            if nvenc_available("hevc_nvenc") {
+                ("hevc_nvenc", true)
+            } else {
+                ("libx265", false)
+            }
+        }
+        "h264_x264" => ("libx264", false),
+        "h265_x265" => ("libx265", false),
+        _ => {
+            if nvenc_available("h264_nvenc") {
+                ("h264_nvenc", true)
+            } else {
+                ("libx264", false)
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn export_video(
     state: tauri::State<'_, AppState>,
@@ -978,32 +1327,66 @@ async fn export_video(
     destination: String,
     runtime: String,
     settings: RenderSettings,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
 ) -> Result<u32, String> {
-    let (w, h, total_frames, fps) = video_probe(&path)?;
+    let (source_w, source_h, total_frames, fps) = video_probe(&path)?;
+    let vsr_mode = settings.upscale == "vsr";
+    let (mut w, mut h) = sanitize_output(output_width, output_height).unwrap_or((source_w, source_h));
+    if !(vsr_mode && w > source_w && h > source_h) {
+        // 放大功能整体依赖 RTX VSR：未启用时导出不超过源分辨率
+        w = w.min(source_w);
+        h = h.min(source_h);
+    }
+    // VSR 模式且在放大时：解码保持源分辨率，放大交给 GPU，其余交给 FFmpeg scale
+    let bypass = vsr_mode && w > source_w && h > source_h;
+    let (decode_w, decode_h) = if bypass {
+        (source_w, source_h)
+    } else {
+        (w, h)
+    };
+    let quality = settings.encoder_quality.clamp(0, 51);
+    let quality_s = quality.to_string();
+    let (encoder, hw) = resolve_encoder(&settings.encoder);
+    // NVENC 分辨率上限：H.264 4096×4096，H.265 8192×8192
+    if hw && encoder == "h264_nvenc" && (w > 4096 || h > 4096) {
+        return Err(format!(
+            "H.264 (NVENC) 最高支持 4096×4096，当前输出 {w}×{h}；请在编码器设置改用 H.265 或降低输出尺寸。"
+        ));
+    }
+    if hw && encoder == "hevc_nvenc" && (w > 8192 || h > 8192) {
+        return Err(format!("H.265 (NVENC) 最高支持 8192×8192，当前输出 {w}×{h}。"));
+    }
+    let label = match encoder {
+        "h264_nvenc" => "H.264 NVENC".to_string(),
+        "hevc_nvenc" => "H.265 NVENC".to_string(),
+        "libx264" => "H.264 x264 (CPU)".to_string(),
+        _ => "H.265 x265 (CPU)".to_string(),
+    };
     begin_export_progress(&state, total_frames)?;
-    let nvenc = nvenc_available();
     set_export_progress(
         &state,
         true,
         0,
         total_frames,
-        if nvenc {
-            "已启用 NVENC，正在导出…".into()
-        } else {
-            "NVENC 不可用，使用 CPU 编码…".into()
-        },
+        format!("使用 {label}，正在导出 {w}×{h}…"),
     );
     let mut current = 0;
     let result: Result<u32, String> = (|| {
-        let frame_bytes = (w * h * 4) as usize;
-        let mut decode = tool("ffmpeg")?
-            .args([
-                "-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "rgba", "-",
-            ])
+        let frame_bytes = (decode_w * decode_h * 4) as usize;
+        let scale_filter = format!("scale={w}:{h}:flags=lanczos");
+        let mut command = tool("ffmpeg")?;
+        command.args(["-v", "error", "-i", &path]);
+        if !bypass && (w, h) != (source_w, source_h) {
+            command.args(["-vf", &scale_filter]);
+        }
+        let mut decode = command
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 解码器: {e}"))?;
-        // 音轨在编码器内统一转为 AAC 后写入 MP4，避免源音频编码与 MP4 容器不兼容。
+        // 音轨按设置附带（统一转 AAC 写入 MP4），关闭"保持音频"时输出纯视频。
         let mut encode = tool("ffmpeg")?
             .args([
                 "-y",
@@ -1023,39 +1406,62 @@ async fn export_video(
                 &path,
                 "-map",
                 "0:v",
-                "-map",
-                "1:a?",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-pix_fmt",
-                "yuv420p",
-                "-shortest",
             ])
-            .args(if nvenc {
-                &[
+            .args(if settings.keep_audio {
+                vec![
+                    "-map",
+                    "1:a?",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-shortest",
+                ]
+            } else {
+                Vec::new()
+            })
+            .args(["-pix_fmt", "yuv420p"])
+            .args(if hw {
+                vec![
                     "-c:v",
-                    "h264_nvenc",
+                    encoder,
                     "-preset",
                     "p5",
                     "-rc",
                     "vbr",
                     "-cq",
-                    "23",
+                    quality_s.as_str(),
                     "-b:v",
                     "0",
-                ][..]
+                ]
             } else {
-                &["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"][..]
+                vec!["-c:v", encoder, "-preset", "veryfast", "-crf", quality_s.as_str()]
             })
             .arg(&destination)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 编码器: {e}"))?;
         let mut reader = decode.stdout.take().ok_or("无法读取视频数据")?;
         let mut writer = encode.stdin.take().ok_or("无法写入视频数据")?;
+        // 两个 ffmpeg 的 stderr 由线程收集，失败时附带在错误信息里便于定位
+        let decode_stderr = decode.stderr.take();
+        let decode_stderr_thread = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut stderr) = decode_stderr {
+                let _ = stderr.read_to_end(&mut buffer);
+            }
+            buffer
+        });
+        let encode_stderr = encode.stderr.take();
+        let encode_stderr_thread = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut stderr) = encode_stderr {
+                let _ = stderr.read_to_end(&mut buffer);
+            }
+            buffer
+        });
         // 预读线程：GPU 推理当前帧的同时预取下一帧，解除读帧与渲染的串行
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(3);
         let reader_thread = std::thread::spawn(move || {
@@ -1099,11 +1505,24 @@ async fn export_video(
                         break;
                     }
                 };
+                let data: Vec<u8> = if bypass {
+                    match RgbaImage::from_raw(decode_w, decode_h, frame) {
+                        Some(image) => {
+                            upscale_frame(&state, image, (w, h), settings.vsr_quality).into_raw()
+                        }
+                        None => {
+                            outcome = Err("无效视频帧".into());
+                            break;
+                        }
+                    }
+                } else {
+                    frame
+                };
                 let rendered = match unsafe {
                     host.as_mut().unwrap().render(
                         &state.root,
                         &runtime,
-                        &frame,
+                        &data,
                         w,
                         h,
                         &settings,
@@ -1137,11 +1556,18 @@ async fn export_video(
             let _ = decode.kill();
             let _ = encode.kill();
         }
+        let encode_tail = recent_text(encode_stderr_thread.join().unwrap_or_default());
         if !decode.wait().map_err(|e| e.to_string())?.success() && outcome.is_ok() {
-            outcome = Err("FFmpeg 解码失败。".into());
+            let decode_tail = recent_text(decode_stderr_thread.join().unwrap_or_default());
+            outcome = Err(format!("FFmpeg 解码失败。{decode_tail}"));
         }
         if !encode.wait().map_err(|e| e.to_string())?.success() && outcome.is_ok() {
-            outcome = Err("FFmpeg 编码失败。".into());
+            outcome = Err(format!("FFmpeg 编码失败。{encode_tail}"));
+        }
+        if let Err(message) = outcome.as_mut() {
+            if !encode_tail.is_empty() && !message.contains("编码器输出") {
+                message.push_str(&format!("；编码器输出: {encode_tail}"));
+            }
         }
         if outcome.is_ok() {
             outcome = Ok(count);
@@ -1205,6 +1631,8 @@ fn main() {
                 root,
                 temp_dir,
                 host: Mutex::new(None),
+                vsr: Mutex::new(None),
+                vsr_disabled: AtomicBool::new(false),
                 media: Mutex::new(HashMap::new()),
                 decoder: Mutex::new(None),
                 temp_counter: AtomicU64::new(0),
@@ -1234,7 +1662,8 @@ fn main() {
             save_data_png,
             frame_png,
             render_frame_png,
-            export_video
+            export_video,
+            vsr_probe
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 应用启动失败");

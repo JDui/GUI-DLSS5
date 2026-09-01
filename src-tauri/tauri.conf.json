@@ -12,6 +12,6 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
-    "resources": ["../dlssnr_host.dll", "../nvngx_dlssnr.dll", "../nvngx_dlssnr_30.dll", "../nvngx_dlssnr_40.dll"]
+    "resources": ["../dlssnr_host.dll", "../nvngx_dlssnr.dll", "../nvngx_dlssnr_30.dll", "../nvngx_dlssnr_40.dll", "../nvngx_vsr.dll", "../rtx_vsr_host.dll"]
   }
 }

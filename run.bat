@@ -27,6 +27,7 @@ if not exist "%APP%" (
     popd
     exit /b 1
   )
+  copy "%CD%\src-tauri\target\release\dlss5-tauri.exe" "%APP%"
 )
 if not exist "%APP%" (
   echo Build completed but the executable was not found:
