@@ -109,6 +109,10 @@ struct Host {
     runtime: String,
     width: i32,
     height: i32,
+    // 运动矢量与深度恒为零输入（无引擎数据），随会话按尺寸复用，避免逐帧分配 25MB
+    motion: Vec<f32>,
+    depth: Vec<f32>,
+    output: Vec<u8>,
     ready: bool,
 }
 
@@ -145,6 +149,9 @@ impl Host {
             runtime: runtime.into(),
             width: 0,
             height: 0,
+            motion: Vec::new(),
+            depth: Vec::new(),
+            output: Vec::new(),
             ready: false,
         })
     }
@@ -200,6 +207,12 @@ impl Host {
             self.width = width;
             self.height = height;
         }
+        let pixels = (width.max(0) as usize) * (height.max(0) as usize);
+        if self.motion.len() != pixels * 2 {
+            self.motion = vec![0_f32; pixels * 2];
+            self.depth = vec![0_f32; pixels];
+            self.output = vec![0_u8; pixels * 4];
+        }
         Ok(())
     }
 
@@ -207,27 +220,27 @@ impl Host {
         &mut self,
         root: &Path,
         runtime: &str,
-        mut input: Vec<u8>,
+        input: &[u8],
         width: u32,
         height: u32,
         settings: &RenderSettings,
         reset: bool,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<&[u8], String> {
         self.ensure(root, runtime, width as i32, height as i32, settings)?;
-        let mut motion = vec![0_f32; (width * height * 2) as usize];
-        let mut depth = vec![0_f32; (width * height) as usize];
-        let mut output = vec![0_u8; input.len()];
+        if input.len() != self.output.len() {
+            return Err("帧数据长度与 DLSS 会话不符。".into());
+        }
         if (self.process)(
-            input.as_mut_ptr(),
-            motion.as_mut_ptr(),
-            depth.as_mut_ptr(),
-            output.as_mut_ptr(),
+            input.as_ptr() as *mut u8,
+            self.motion.as_mut_ptr(),
+            self.depth.as_mut_ptr(),
+            self.output.as_mut_ptr(),
             i32::from(reset),
         ) == 0
         {
             return Err("DLSS 未生成画面。".into());
         }
-        Ok(output)
+        Ok(self.output.as_slice())
     }
 }
 
@@ -683,18 +696,13 @@ fn process_rgba(
     if host.is_none() {
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
     }
-    let output = unsafe {
-        host.as_mut().unwrap().render(
-            &state.root,
-            &runtime,
-            image.into_raw(),
-            w,
-            h,
-            &settings,
-            true,
-        )?
+    let input = image.into_raw();
+    let rendered = unsafe {
+        host.as_mut()
+            .unwrap()
+            .render(&state.root, &runtime, &input, w, h, &settings, true)?
     };
-    rgba_png(output, w, h)
+    rgba_png(rendered.to_vec(), w, h)
 }
 
 #[tauri::command]
@@ -879,18 +887,13 @@ async fn save_png(
         if host.is_none() {
             *host = Some(unsafe { Host::load(&state.root, &runtime)? });
         }
+        let input = image.into_raw();
         let out = unsafe {
-            host.as_mut().unwrap().render(
-                &state.root,
-                &runtime,
-                image.into_raw(),
-                w,
-                h,
-                &settings,
-                true,
-            )?
+            host.as_mut()
+                .unwrap()
+                .render(&state.root, &runtime, &input, w, h, &settings, true)?
         };
-        RgbaImage::from_raw(w, h, out)
+        RgbaImage::from_raw(w, h, out.to_vec())
             .ok_or("无效输出")?
             .save(&destination)
             .map_err(|e| format!("无法写入 PNG: {e}"))?;
@@ -924,21 +927,54 @@ async fn preview_video_frame(
     if host.is_none() {
         *host = Some(unsafe { Host::load(&state.root, &runtime)? });
     }
+    let bytes = image.into_raw();
     let rendered = unsafe {
-        host.as_mut().unwrap().render(
-            &state.root,
-            &runtime,
-            image.into_raw(),
-            w,
-            h,
-            &settings,
-            true,
-        )?
+        host.as_mut()
+            .unwrap()
+            .render(&state.root, &runtime, &bytes, w, h, &settings, true)?
     };
     Ok(VideoFramePreview {
         original,
-        processed: rgba_png(rendered, w, h)?,
+        processed: rgba_png(rendered.to_vec(), w, h)?,
     })
+}
+
+// 预检 NVENC 会话是否可用（驱动/并发限制），失败则回退 CPU 编码
+fn nvenc_available() -> bool {
+    let Ok(mut command) = tool("ffmpeg") else {
+        return false;
+    };
+    command
+        .args([
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=320x180:d=0.2",
+            "-frames:v",
+            "5",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-rc",
+            "vbr",
+            "-cq",
+            "23",
+            "-b:v",
+            "0",
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -951,8 +987,21 @@ async fn export_video(
 ) -> Result<u32, String> {
     let (w, h, total_frames, fps) = video_probe(&path)?;
     begin_export_progress(&state, total_frames)?;
+    let nvenc = nvenc_available();
+    set_export_progress(
+        &state,
+        true,
+        0,
+        total_frames,
+        if nvenc {
+            "已启用 NVENC，正在导出…".into()
+        } else {
+            "NVENC 不可用，使用 CPU 编码…".into()
+        },
+    );
     let mut current = 0;
     let result: Result<u32, String> = (|| {
+        let frame_bytes = (w * h * 4) as usize;
         let mut decode = tool("ffmpeg")?
             .args([
                 "-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "rgba", "-",
@@ -983,75 +1032,126 @@ async fn export_video(
                 "0:v",
                 "-map",
                 "1:a?",
-                "-c:v",
-                "libx264",
                 "-c:a",
                 "copy",
                 "-pix_fmt",
                 "yuv420p",
                 "-shortest",
-                &destination,
             ])
+            .args(if nvenc {
+                &[
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p5",
+                    "-rc",
+                    "vbr",
+                    "-cq",
+                    "23",
+                    "-b:v",
+                    "0",
+                ][..]
+            } else {
+                &["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"][..]
+            })
+            .arg(&destination)
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 编码器: {e}"))?;
         let mut reader = decode.stdout.take().ok_or("无法读取视频数据")?;
         let mut writer = encode.stdin.take().ok_or("无法写入视频数据")?;
-        let mut buffer = vec![0_u8; (w * h * 4) as usize];
+        // 预读线程：GPU 推理当前帧的同时预取下一帧，解除读帧与渲染的串行
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(3);
+        let reader_thread = std::thread::spawn(move || {
+            let mut buffer = vec![0_u8; frame_bytes];
+            loop {
+                let mut read = 0;
+                while read < buffer.len() {
+                    match reader.read(&mut buffer[read..]) {
+                        Ok(0) => break,
+                        Ok(n) => read += n,
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                            return;
+                        }
+                    }
+                }
+                if read == 0 {
+                    return;
+                }
+                if read != buffer.len() {
+                    let _ = tx.send(Err("视频流末尾帧不完整。".into()));
+                    return;
+                }
+                if tx.send(Ok(buffer.clone())).is_err() {
+                    return;
+                }
+            }
+        });
         let mut count = 0;
-        let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
-        if host.is_none() {
-            *host = Some(unsafe { Host::load(&state.root, &runtime)? });
-        }
-        loop {
-            let mut read = 0;
-            while read < buffer.len() {
-                let n = reader
-                    .read(&mut buffer[read..])
-                    .map_err(|e| e.to_string())?;
-                if n == 0 {
+        let mut outcome: Result<u32, String> = Ok(0);
+        {
+            let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
+            if host.is_none() {
+                *host = Some(unsafe { Host::load(&state.root, &runtime)? });
+            }
+            for message in rx {
+                let frame = match message {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                };
+                let rendered = match unsafe {
+                    host.as_mut().unwrap().render(
+                        &state.root,
+                        &runtime,
+                        &frame,
+                        w,
+                        h,
+                        &settings,
+                        count == 0,
+                    )
+                } {
+                    Ok(rendered) => rendered,
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                };
+                if let Err(e) = writer.write_all(rendered) {
+                    outcome = Err(format!("视频编码写入失败: {e}"));
                     break;
                 }
-                read += n;
+                count += 1;
+                current = count;
+                set_export_progress(
+                    &state,
+                    true,
+                    current,
+                    total_frames,
+                    format!("正在导出第 {current} / {total_frames} 帧"),
+                );
             }
-            if read == 0 {
-                break;
-            }
-            if read != buffer.len() {
-                return Err("视频流末尾帧不完整。".into());
-            }
-            let rendered = unsafe {
-                host.as_mut().unwrap().render(
-                    &state.root,
-                    &runtime,
-                    buffer.clone(),
-                    w,
-                    h,
-                    &settings,
-                    count == 0,
-                )?
-            };
-            writer
-                .write_all(&rendered)
-                .map_err(|e| format!("视频编码写入失败: {e}"))?;
-            count += 1;
-            current = count;
-            set_export_progress(
-                &state,
-                true,
-                current,
-                total_frames,
-                format!("正在导出第 {current} / {total_frames} 帧"),
-            );
         }
+        let _ = reader_thread.join();
         drop(writer);
-        if !decode.wait().map_err(|e| e.to_string())?.success() {
-            return Err("FFmpeg 解码失败。".into());
+        if outcome.is_err() {
+            let _ = decode.kill();
+            let _ = encode.kill();
         }
-        if !encode.wait().map_err(|e| e.to_string())?.success() {
-            return Err("FFmpeg 编码失败。".into());
+        if !decode.wait().map_err(|e| e.to_string())?.success() && outcome.is_ok() {
+            outcome = Err("FFmpeg 解码失败。".into());
         }
-        Ok(count)
+        if !encode.wait().map_err(|e| e.to_string())?.success() && outcome.is_ok() {
+            outcome = Err("FFmpeg 编码失败。".into());
+        }
+        if outcome.is_ok() {
+            outcome = Ok(count);
+        }
+        outcome
     })();
     finish_export_progress(&state, &result, current);
     result
@@ -1068,7 +1168,7 @@ fn main() {
         let settings = RenderSettings::default();
         let mut host = unsafe { Host::load(&root, runtime) }.expect("无法加载 DLSS 宿主");
         let input = vec![128_u8; 640 * 360 * 4];
-        match unsafe { host.render(&root, runtime, input, 640, 360, &settings, true) } {
+        match unsafe { host.render(&root, runtime, &input, 640, 360, &settings, true) } {
             Ok(output) if output.len() == 640 * 360 * 4 => {
                 println!("DLSS_SELFTEST_OK RTX{runtime}");
                 return;
