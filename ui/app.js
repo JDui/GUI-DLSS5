@@ -10,7 +10,7 @@ let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, sourceData:null, originalUrl:null, processedUrl:null, loadedFrame:-1, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false, quickOriginal:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
 const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
-const settings = () => ({ multiPass:$('multi-pass').checked, passCount:+$('pass-count').value, style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, brightness:+$('post-brightness').value, contrast:+$('post-contrast').value, saturation:+$('post-saturation').value, postPerPass:$('post-per-pass').checked, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
+const settings = () => ({ multiPass:$('multi-pass').checked, passCount:+$('pass-count').value, style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, brightness:+$('post-brightness').value, contrast:+$('post-contrast').value, saturation:+$('post-saturation').value, postPerPass:$('post-per-pass').checked, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, interpolation:+$('interp').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
 const upscaleArgs = () => ({ upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value });
 function log(message) { console.debug(`[DLSS5] ${message}`); }
 function status(message) { $('status').textContent = message; }
@@ -54,6 +54,14 @@ function sourceSize() { const w=state.info?.width||originalPreview.naturalWidth|
 function markRatio() { const base=sourceSize(),w=+$('out-width').value,h=+$('out-height').value; [['ratio-1',1],['ratio-2',2],['ratio-4',4]].forEach(([id,k])=>{ const t=base?fitOutput(base[0]*k,base[1]*k):null; $(id).classList.toggle('active',!!t&&t[0]===w&&t[1]===h); }); }
 function syncOutputInputs() { const s=outputSize(); if(s){$('out-width').value=s[0];$('out-height').value=s[1];} markRatio(); }
 function updateSizeNote() { const s=sourceSize(), el=$('size-note'); if(el) el.textContent=s?`原始 ${s[0]}×${s[1]}`:''; }
+let interpAuto = true;
+function updateInterpDefault() {
+  const fps = state.info?.fps || 0;
+  const note = $('interp-note');
+  if (note) note.textContent = fps > 0 ? `当前视频 ${fps >= 100 ? fps.toFixed(0) : fps.toFixed(2)} fps` : '';
+  if (interpAuto && fps > 0) $('interp').value = fps >= 60 ? '1' : '2';
+}
+$('interp').onchange = () => { interpAuto = false; };
 function setRatio(k) { if(!vsrEnabled())return; const base=sourceSize(); if(!base)return; const t=fitOutput(base[0]*k,base[1]*k); if(!t)return; $('out-width').value=t[0]; $('out-height').value=t[1]; markRatio(); refresh(true); }
 $('ratio-1').onclick=()=>setRatio(1); $('ratio-2').onclick=()=>setRatio(2); $('ratio-4').onclick=()=>setRatio(4);
 $('out-width').onchange=$('out-height').onchange=()=>{syncOutputInputs();refresh(true);};
@@ -159,7 +167,7 @@ async function loadPath(path) {
   refreshQueuedFit=false;
   const info=await invoke('media_info',{path}); revokeMedia(); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,sourceData:null,splitX:null,loadedFrame:-1});
   const initial=fitOutput(info.width,info.height)||[info.width,info.height];
-  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote();
+  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote(); updateInterpDefault();
   if(info.kind==='video') {
     status('正在生成首帧预览…');
     state.originalUrl=await invokePng('frame_png',{path:info.path,frame:0,maxSide:PREVIEW_MAX_SIDE,...outputArgs(),...upscaleArgs()});
@@ -418,13 +426,14 @@ function batchSummary() {
   const ratio = (vsrEnabled() && sourceSize() && outputSize()) ? $('out-width').value / sourceSize()[0] : 1;
   const ratioText = ratio > 1 ? ` X${+ratio.toFixed(2)}` : '';
   const up = vsrEnabled() ? `RTX VSR${ratioText}（质量 ${$('vsr-quality').value}）` : '关闭';
+  const interp = { '1': '关闭', '2': '2x', '3': '3x', '4': '4x' }[$('interp').value] || '关闭';
   const enc = { 'h264_nvenc': 'H.264 NVENC', 'h265_nvenc': 'H.265 NVENC', 'h264_x264': 'H.264 x264', 'h265_x265': 'H.265 x265' }[$('encoder').value] || $('encoder').value;
   const styleText = $('style').selectedOptions[0] ? $('style').selectedOptions[0].textContent : '默认';
   const postOn = $('post-brightness').value !== '1' || $('post-contrast').value !== '1' || $('post-saturation').value !== '1';
   const postText = postOn ? ` · 后处理 亮度${$('post-brightness').value}/对比度${$('post-contrast').value}/饱和度${$('post-saturation').value}` : '';
   const pass = $('multi-pass').checked ? ` · 多重Pass ×${$('pass-count').value}` : '';
   return [
-    `放大：${up}`,
+    `放大：${up} · 插帧：${interp}（RIFE v4.6）`,
     `编码器：${enc} · 质量 ${$('encoder-quality').value} · ${$('keep-audio').checked ? '保持音频' : '不含音频'}`,
     `DLSS 参数：风格 ${styleText} · 处理强度 ${$('intensity').value}${pass}${postText}`,
   ].join('\n');
