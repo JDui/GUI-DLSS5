@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DLSS5 Neural Render",
-  "version": "0.1.4",
+  "version": "0.1.17",
   "identifier": "com.rinsousei.dlss5tool",
   "build": { "frontendDist": "../ui" },
   "app": {
     "withGlobalTauri": true,
-    "windows": [{ "title": "DLSS5 Neural Render v0.1.15", "width": 1472, "height": 989, "minWidth": 980, "minHeight": 700, "resizable": true, "dragDropEnabled": true }],
+    "windows": [{ "title": "DLSS5 Neural Render v0.1.17", "width": 1472, "height": 989, "minWidth": 980, "minHeight": 700, "resizable": true, "dragDropEnabled": true }],
     "security": { "csp": null }
   },
   "bundle": {

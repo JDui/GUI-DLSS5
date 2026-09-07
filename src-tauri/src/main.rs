@@ -78,7 +78,7 @@ impl Default for RenderSettings {
             brightness: 1.0,
             contrast: 1.0,
             saturation: 1.0,
-            post_per_pass: true,
+            post_per_pass: false,
             upscale: "vsr".into(),
             vsr_quality: 4,
             encoder: "h265_nvenc".into(),

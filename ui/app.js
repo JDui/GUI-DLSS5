@@ -1,9 +1,10 @@
 const invoke = window.__TAURI__.core.invoke;
 const $ = id => document.getElementById(id);
-const DEFAULT_RENDER_SETTINGS = { style:2, skinStructure:0.1, useAutoMask:true };
+const DEFAULT_RENDER_SETTINGS = { style:2, skinStructure:0.1, useAutoMask:true, postPerPass:false };
 $('style').value = DEFAULT_RENDER_SETTINGS.style;
 $('skin').value = $('skin-num').value = DEFAULT_RENDER_SETTINGS.skinStructure;
 $('auto-mask').checked = DEFAULT_RENDER_SETTINGS.useAutoMask;
+$('post-per-pass').checked = DEFAULT_RENDER_SETTINGS.postPerPass;
 const PREVIEW_MAX_SIDE = 4520;
 $('out-width').parentElement.title = `自定义输出分辨率；预览横竖任一单边最高 ${PREVIEW_MAX_SIDE}，导出按此尺寸处理`;
 let runtimeReady = Promise.resolve();
