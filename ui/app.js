@@ -10,7 +10,7 @@ let runtimeReady = Promise.resolve();
 const state = { path:null, sourcePath:null, kind:null, info:null, sourceData:null, originalUrl:null, processedUrl:null, loadedFrame:-1, zoom:1, fit:1, panX:0, panY:0, splitX:null, dragging:null, request:0, busy:false, quickOriginal:false };
 const stage = $('stage'), preview = $('preview'), originalPreview = $('original-preview'), originalMask = $('original-mask'), abView = $('ab-view');
 const abPanes = Array.from(abView.querySelectorAll('.ab-pane')), abOriginal = $('ab-original'), abProcessed = $('ab-processed');
-const settings = () => ({ multiPass:$('multi-pass').checked, passCount:+$('pass-count').value, style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
+const settings = () => ({ multiPass:$('multi-pass').checked, passCount:+$('pass-count').value, style:+$('style').value, intensity:+$('intensity').value, localTone:+$('tone').value, localStruct:+$('struct').value, skinStructure:+$('skin').value, useAutoMask:$('auto-mask').checked, uiCorrection:$('ui-correction').checked, outputView:0, outputMix:1, brightness:+$('post-brightness').value, contrast:+$('post-contrast').value, saturation:+$('post-saturation').value, postPerPass:$('post-per-pass').checked, upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value, encoder:$('encoder').value, encoderQuality:+$('encoder-quality').value, keepAudio:$('keep-audio').checked });
 const upscaleArgs = () => ({ upscale:$('upscale').value, vsrQuality:+$('vsr-quality').value });
 function log(message) { console.debug(`[DLSS5] ${message}`); }
 function status(message) { $('status').textContent = message; }
@@ -19,8 +19,10 @@ async function urlToDataUri(url) { const blob = await (await fetch(url)).blob();
 // 延迟回收：导出/复制会异步加载正在显示的 URL，立即回收会中断在途加载
 function deferRevoke(url) { if(url) setTimeout(() => URL.revokeObjectURL(url), 5000); }
 function revokeMedia() { deferRevoke(state.originalUrl); deferRevoke(state.processedUrl); state.originalUrl=null; state.processedUrl=null; }
-function syncControls(range, number) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(1, +$(number).value || 0)); refresh(); }; }
+function syncControls(range, number, max=1) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(max, +$(number).value || 0)); refresh(); }; }
 syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num'); syncControls('skin','skin-num');
+syncControls('post-brightness','post-brightness-num',2); syncControls('post-contrast','post-contrast-num',2); syncControls('post-saturation','post-saturation-num',2);
+$('post-per-pass').onchange=()=>refresh();
 $('auto-mask').onchange=()=>refresh(); $('ui-correction').onchange=()=>refresh();
 $('multi-pass').onchange=()=>{ $('pass-control').hidden=!$('multi-pass').checked; refresh(); };
 function syncPassCount(value) {
@@ -334,3 +336,146 @@ const paramTip=document.createElement('div');paramTip.id='param-tip';document.bo
 function showParamTip(info){const text=PARAM_TIPS[info.dataset.param];if(!text)return;paramTip.textContent=text;paramTip.style.display='block';const r=info.getBoundingClientRect(),tw=paramTip.offsetWidth,th=paramTip.offsetHeight;let x=r.left-tw-10;if(x<8)x=Math.min(window.innerWidth-tw-8,Math.max(8,r.left));const y=Math.max(8,Math.min(window.innerHeight-th-8,r.top+r.height/2-th/2));paramTip.style.left=`${x}px`;paramTip.style.top=`${y}px`;}
 document.addEventListener('mouseover',e=>{const info=e.target.closest('.info');if(info)showParamTip(info);else if(paramTip.style.display==='block')paramTip.style.display='none';});
 document.addEventListener('mouseleave',()=>paramTip.style.display='none');
+
+// ===== 批量处理 =====
+let batchRows = [];
+let batchDir = '';
+let batchRunning = false;
+let batchPollTimer = null;
+
+function renderBatchRows() {
+  const list = $('batch-list');
+  list.innerHTML = '';
+  if (!batchRows.length) {
+    list.innerHTML = '<div class="batch-empty">尚未选择视频</div>';
+    return;
+  }
+  batchRows.forEach((r, i) => {
+    const row = document.createElement('div');
+    row.className = 'batch-row';
+    row.id = `batch-row-${i}`;
+    row.innerHTML = `<span class="row-name" title="${r.path}">${r.name}</span>` +
+      `<progress class="row-bar" max="100" value="0" hidden></progress>` +
+      `<span class="row-status">待处理</span>`;
+    list.appendChild(row);
+  });
+}
+
+function applyBatchState(b) {
+  b.jobs.forEach((job, i) => {
+    const row = $(`batch-row-${i}`);
+    if (!row) return;
+    const bar = row.querySelector('.row-bar');
+    const label = row.querySelector('.row-status');
+    label.classList.remove('ok', 'bad');
+    if (job.status === 'running') {
+      bar.hidden = false;
+      bar.value = job.frames ? (job.current / job.frames) * 100 : 0;
+      label.textContent = `${job.current}/${job.frames} · ${job.fps.toFixed(1)} fps`;
+    } else if (job.status === 'done') {
+      bar.hidden = true;
+      label.textContent = '✓ 已完成';
+      label.classList.add('ok');
+    } else if (job.status === 'failed') {
+      bar.hidden = true;
+      label.textContent = '✗ 失败';
+      label.classList.add('bad');
+      label.title = job.error || '';
+    } else if (job.status === 'cancelled') {
+      bar.hidden = true;
+      label.textContent = '已取消';
+    } else {
+      bar.hidden = true;
+      label.textContent = '待处理';
+    }
+  });
+  if (b.cancelled) status('批量任务已取消');
+}
+
+function stopBatchPoll() { if (batchPollTimer) { clearInterval(batchPollTimer); batchPollTimer = null; } }
+
+function finishBatchPoll() {
+  stopBatchPoll();
+  batchRunning = false;
+  $('batch-start').disabled = false;
+  $('batch-add').disabled = false;
+  $('batch-cancel').hidden = true;
+  invoke('batch_state').then(b => { if ($('batch-modal').hidden === false) applyBatchState(b); }).catch(() => {});
+}
+
+function startBatchPoll() {
+  stopBatchPoll();
+  batchPollTimer = setInterval(async () => {
+    try {
+      const b = await invoke('batch_state');
+      if ($('batch-modal').hidden === false) applyBatchState(b);
+      if (!b.running) finishBatchPoll();
+    } catch (e) { log(`批量: ${e}`); }
+  }, 200);
+}
+
+function batchSummary() {
+  const ratio = (vsrEnabled() && sourceSize() && outputSize()) ? $('out-width').value / sourceSize()[0] : 1;
+  const ratioText = ratio > 1 ? ` X${+ratio.toFixed(2)}` : '';
+  const up = vsrEnabled() ? `RTX VSR${ratioText}（质量 ${$('vsr-quality').value}）` : '关闭';
+  const enc = { 'h264_nvenc': 'H.264 NVENC', 'h265_nvenc': 'H.265 NVENC', 'h264_x264': 'H.264 x264', 'h265_x265': 'H.265 x265' }[$('encoder').value] || $('encoder').value;
+  const styleText = $('style').selectedOptions[0] ? $('style').selectedOptions[0].textContent : '默认';
+  const postOn = $('post-brightness').value !== '1' || $('post-contrast').value !== '1' || $('post-saturation').value !== '1';
+  const postText = postOn ? ` · 后处理 亮度${$('post-brightness').value}/对比度${$('post-contrast').value}/饱和度${$('post-saturation').value}` : '';
+  const pass = $('multi-pass').checked ? ` · 多重Pass ×${$('pass-count').value}` : '';
+  return [
+    `放大：${up}`,
+    `编码器：${enc} · 质量 ${$('encoder-quality').value} · ${$('keep-audio').checked ? '保持音频' : '不含音频'}`,
+    `DLSS 参数：风格 ${styleText} · 处理强度 ${$('intensity').value}${pass}${postText}`,
+  ].join('\n');
+}
+$('batch-open').onclick = () => { $('batch-modal').hidden = false; $('batch-summary').textContent = batchSummary(); renderBatchRows(); if (batchRunning) startBatchPoll(); };
+$('batch-close').onclick = () => {
+  if (batchRunning && !confirm('批量处理正在进行，确定关闭？')) return;
+  if (batchRunning) invoke('batch_cancel');
+  $('batch-modal').hidden = true;
+  stopBatchPoll();
+};
+$('batch-add').onclick = async () => {
+  try {
+    const paths = await invoke('choose_media_multi');
+    if (!paths) return;
+    for (const p of paths) {
+      if (!batchRows.some(r => r.path === p)) batchRows.push({ path: p, name: p.substring(Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/')) + 1) });
+    }
+    renderBatchRows();
+  } catch (e) { log(`批量: ${e}`); }
+};
+$('batch-dir').onclick = async () => {
+  try {
+    const dir = await invoke('choose_directory');
+    if (dir) { batchDir = dir; $('batch-dir-label').textContent = dir; $('batch-dir-label').title = dir; }
+  } catch (e) { log(`批量: ${e}`); }
+};
+$('batch-start').onclick = async () => {
+  if (batchRunning) return;
+  if (!batchRows.length) { status('请先选择视频'); return; }
+  if (!batchDir) { status('请选择输出文件夹'); return; }
+  batchRunning = true;
+  $('batch-start').disabled = true;
+  $('batch-add').disabled = true;
+  $('batch-cancel').hidden = false;
+  startBatchPoll();
+  try {
+    await invoke('batch_export', {
+      paths: batchRows.map(r => r.path),
+      outputDir: batchDir,
+      runtime: $('runtime').value,
+      settings: settings(),
+      outputRatio: (vsrEnabled() && sourceSize() && outputSize()) ? $('out-width').value / sourceSize()[0] : null,
+    });
+  } catch (e) {
+    log(`批量: ${e}`);
+    status(`批量导出失败: ${e}`);
+  }
+  finishBatchPoll();
+};
+$('batch-cancel').onclick = () => {
+  invoke('batch_cancel');
+  status('正在取消批量任务…');
+};

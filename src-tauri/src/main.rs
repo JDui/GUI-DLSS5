@@ -50,6 +50,10 @@ struct RenderSettings {
     ui_correction: bool,
     output_view: i32,
     output_mix: f32,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    post_per_pass: bool,
     upscale: String,
     vsr_quality: i32,
     encoder: String,
@@ -71,6 +75,10 @@ impl Default for RenderSettings {
             ui_correction: false,
             output_view: 0,
             output_mix: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            post_per_pass: true,
             upscale: "vsr".into(),
             vsr_quality: 4,
             encoder: "h265_nvenc".into(),
@@ -374,6 +382,7 @@ struct AppState {
     export_progress: Mutex<ExportProgress>,
     export_paused: AtomicBool,
     export_cancel: AtomicBool,
+    batch: Mutex<BatchProgress>,
 }
 
 struct VideoDecoder {
@@ -469,7 +478,7 @@ fn detect_gpu_info() -> GpuInfo {
     }
 }
 
-fn begin_export_progress(state: &AppState, total: u32) -> Result<(), String> {
+fn begin_export_progress(state: &AppState, total: Option<u32>) -> Result<(), String> {
     let mut progress = state
         .export_progress
         .lock()
@@ -480,7 +489,7 @@ fn begin_export_progress(state: &AppState, total: u32) -> Result<(), String> {
     *progress = ExportProgress {
         active: true,
         current: 0,
-        total: total.max(1),
+        total: total.unwrap_or(1).max(1),
         message: "准备导出…".into(),
     };
     state.export_paused.store(false, Ordering::Release);
@@ -823,6 +832,29 @@ fn render_dlss_frame(
     RgbaImage::from_raw(w, h, output).ok_or("无效 DLSS 输出".into())
 }
 
+/// 亮度/对比度/饱和度后处理：对 RGBA8 图像做逐像素调整。
+fn post_process(image: &mut RgbaImage, brightness: f32, contrast: f32, saturation: f32) {
+    // 三个参数均为默认值时跳过逐像素处理，避免不必要的开销
+    if (brightness - 1.0).abs() < f32::EPSILON
+        && (contrast - 1.0).abs() < f32::EPSILON
+        && (saturation - 1.0).abs() < f32::EPSILON
+    {
+        return;
+    }
+    let bo = brightness - 1.0;
+    for px in image.pixels_mut() {
+        let ch = &mut px.0;
+        let luma = 0.299 * ch[0] as f32 + 0.587 * ch[1] as f32 + 0.114 * ch[2] as f32;
+        for c in 0..3 {
+            let mut v = ch[c] as f32;
+            v = luma + (v - luma) * saturation;
+            v = (v - 128.0) * contrast + 128.0;
+            v += bo * 255.0;
+            ch[c] = v.clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 fn render_with_pass_order(
     state: &AppState,
     runtime: &str,
@@ -833,17 +865,32 @@ fn render_with_pass_order(
     strict_vsr: bool,
 ) -> Result<RgbaImage, String> {
     let pass_count = active_pass_count(settings);
+    let post = |img: &mut RgbaImage| {
+        post_process(
+            img,
+            settings.brightness,
+            settings.contrast,
+            settings.saturation,
+        );
+    };
     let Some(target) = post_first_vsr_target else {
-        return render_dlss_frame(state, runtime, image, settings, reset);
+        let mut result = render_dlss_frame(state, runtime, image, settings, reset)?;
+        post(&mut result);
+        return Ok(result);
     };
     if pass_count == 1 {
-        return render_dlss_frame(state, runtime, image, settings, reset);
+        let mut result = render_dlss_frame(state, runtime, image, settings, reset)?;
+        post(&mut result);
+        return Ok(result);
     }
 
     let mut first_pass = settings.clone();
     first_pass.multi_pass = false;
     first_pass.pass_count = 1;
-    let first_output = render_dlss_frame(state, runtime, image, &first_pass, true)?;
+    let mut first_output = render_dlss_frame(state, runtime, image, &first_pass, true)?;
+    if settings.post_per_pass {
+        post(&mut first_output);
+    }
     let upscaled = if strict_vsr {
         upscale_frame_strict(state, first_output, target, settings.vsr_quality)?
     } else {
@@ -853,7 +900,10 @@ fn render_with_pass_order(
     let mut remaining_passes = settings.clone();
     remaining_passes.multi_pass = remaining > 1;
     remaining_passes.pass_count = remaining;
-    render_dlss_frame(state, runtime, upscaled, &remaining_passes, true)
+    let mut result = render_dlss_frame(state, runtime, upscaled, &remaining_passes, true)?;
+    // 末轮始终应用：post_per_pass 关闭时仅在这里应用一次
+    post(&mut result);
+    Ok(result)
 }
 
 fn spawn_decoder(
@@ -1291,7 +1341,7 @@ async fn save_data_png(
     upscale: Option<String>,
     vsr_quality: Option<i32>,
 ) -> Result<(), String> {
-    begin_export_progress(&state, 1)?;
+    begin_export_progress(&state, Some(1))?;
     let vsr = upscale.as_deref() == Some("vsr");
     let quality = vsr_quality.unwrap_or(4);
     let result = image_data_uri(&data).and_then(|image| {
@@ -1337,7 +1387,7 @@ async fn save_png(
     output_width: Option<u32>,
     output_height: Option<u32>,
 ) -> Result<(), String> {
-    begin_export_progress(&state, 1)?;
+    begin_export_progress(&state, Some(1))?;
     let result: Result<(), String> = (|| {
         let image = image::open(&path)
             .map_err(|e| format!("无法读取图片: {e}"))?
@@ -1562,17 +1612,54 @@ fn resolve_encoder(requested: &str) -> (&'static str, bool) {
     }
 }
 
-#[tauri::command]
-async fn export_video(
-    state: tauri::State<'_, AppState>,
-    path: String,
-    destination: String,
-    runtime: String,
-    settings: RenderSettings,
+const BATCH_CANCELLED: &str = "已取消";
+
+// 批量处理：队列中单个任务的进度（前端经 batch_state 轮询渲染）
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchJobProgress {
+    name: String,
+    status: String,
+    current: u32,
+    frames: u32,
+    fps: f64,
+    error: String,
+}
+
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct BatchProgress {
+    running: bool,
+    cancelled: bool,
+    jobs: Vec<BatchJobProgress>,
+}
+
+fn unique_destination(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
+    let mut candidate = dir.join(format!("{stem}_dlss.mp4"));
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = dir.join(format!("{stem}_dlss_{n}.mp4"));
+        n += 1;
+    }
+    candidate
+}
+
+// 单个视频的完整导出管线，单个导出与批量处理共用。
+// on_progress 汇报 (当前帧, 总帧数, 状态描述)；is_cancelled 返回 true 时中止，
+// 删除半成品文件并返回 Err(BATCH_CANCELLED)。
+#[allow(clippy::too_many_arguments)]
+fn export_one_video(
+    state: &AppState,
+    path: &str,
+    destination: &str,
+    runtime: &str,
+    settings: &RenderSettings,
     output_width: Option<u32>,
     output_height: Option<u32>,
+    on_progress: &mut dyn FnMut(u32, u32, String),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<u32, String> {
-    let (source_w, source_h, total_frames, fps) = video_probe(&path)?;
+    let (source_w, source_h, total_frames, fps) = video_probe(path)?;
     let vsr_mode = settings.upscale == "vsr";
     let (mut w, mut h) =
         sanitize_output(output_width, output_height).unwrap_or((source_w, source_h));
@@ -1605,16 +1692,7 @@ async fn export_video(
         "libx264" => "H.264 x264 (CPU)".to_string(),
         _ => "H.265 x265 (CPU)".to_string(),
     };
-    begin_export_progress(&state, total_frames)?;
-    set_export_progress(
-        &state,
-        true,
-        0,
-        total_frames,
-        format!("使用 {label}，正在导出 {w}×{h}…"),
-    );
-    let mut current = 0;
-    let mut cancelled = false;
+    on_progress(0, total_frames, format!("使用 {label}，正在导出 {w}×{h}…"));
     let result: Result<u32, String> = (|| {
         let frame_bytes = (decode_w * decode_h * 4) as usize;
         let scale_filter = format!("scale={w}:{h}:flags=lanczos");
@@ -1733,21 +1811,21 @@ async fn export_video(
             }
         });
         let mut count = 0;
+        let mut cancelled = false;
         let mut outcome: Result<u32, String> = Ok(0);
         for message in rx {
-            if state.export_cancel.load(Ordering::Acquire) {
+            if is_cancelled() {
                 cancelled = true;
-                outcome = Err("导出已取消".into());
+                outcome = Err(BATCH_CANCELLED.into());
                 break;
             }
-            while state.export_paused.load(Ordering::Acquire)
-                && !state.export_cancel.load(Ordering::Acquire)
-            {
+            // 暂停标志为单个导出专用；批量处理期间不会被置位
+            while state.export_paused.load(Ordering::Acquire) && !is_cancelled() {
                 std::thread::sleep(std::time::Duration::from_millis(120));
             }
-            if state.export_cancel.load(Ordering::Acquire) {
+            if is_cancelled() {
                 cancelled = true;
-                outcome = Err("导出已取消".into());
+                outcome = Err(BATCH_CANCELLED.into());
                 break;
             }
             let frame = match message {
@@ -1765,7 +1843,7 @@ async fn export_video(
                 }
             };
             let image = if bypass && !defer_vsr {
-                match upscale_frame_strict(&state, image, (w, h), settings.vsr_quality) {
+                match upscale_frame_strict(state, image, (w, h), settings.vsr_quality) {
                     Ok(upscaled) => upscaled,
                     Err(error) => {
                         outcome = Err(error);
@@ -1776,10 +1854,10 @@ async fn export_video(
                 image
             };
             let rendered = match render_with_pass_order(
-                &state,
-                &runtime,
+                state,
+                runtime,
                 image,
-                &settings,
+                settings,
                 count == 0,
                 defer_vsr.then_some((w, h)),
                 true,
@@ -1795,13 +1873,10 @@ async fn export_video(
                 break;
             }
             count += 1;
-            current = count;
-            set_export_progress(
-                &state,
-                true,
-                current,
+            on_progress(
+                count,
                 total_frames,
-                format!("正在导出第 {current} / {total_frames} 帧"),
+                format!("正在导出第 {count} / {total_frames} 帧"),
             );
         }
         let _ = reader_thread.join();
@@ -1827,16 +1902,235 @@ async fn export_video(
             outcome = Ok(count);
         }
         if cancelled {
-            let _ = std::fs::remove_file(&destination);
+            let _ = std::fs::remove_file(destination);
         }
         outcome
     })();
-    if cancelled {
-        set_export_progress(&state, false, current, total_frames, "导出已取消".into());
+    result
+}
+
+// 单个视频导出：沿用全局进度条与暂停/取消标志
+#[tauri::command]
+async fn export_video(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    destination: String,
+    runtime: String,
+    settings: RenderSettings,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+) -> Result<u32, String> {
+    begin_export_progress(&state, None)?;
+    let mut last = (0_u32, 0_u32);
+    let mut on_progress = |current: u32, total: u32, message: String| {
+        last = (current, total);
+        set_export_progress(&state, true, current, total, message);
+    };
+    let result = export_one_video(
+        &state,
+        &path,
+        &destination,
+        &runtime,
+        &settings,
+        output_width,
+        output_height,
+        &mut on_progress,
+        &|| state.export_cancel.load(Ordering::Acquire),
+    );
+    if result.as_ref().err().map(String::as_str) == Some(BATCH_CANCELLED) {
+        set_export_progress(&state, false, last.0, last.1, "导出已取消".into());
     } else {
-        finish_export_progress(&state, &result, current);
+        finish_export_progress(&state, &result, last.0);
     }
     result
+}
+
+// 选择多个视频文件（批量处理入口）
+#[tauri::command]
+fn choose_media_multi() -> Option<Vec<String>> {
+    rfd::FileDialog::new()
+        .add_filter(
+            "视频",
+            &["mp4", "avi", "mov", "mkv", "webm", "wmv", "m4v", "gif"],
+        )
+        .pick_files()
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        })
+}
+
+// 选择输出文件夹（批量处理）
+#[tauri::command]
+fn choose_directory() -> Option<String> {
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+// 批量导出：按队列逐个走完整导出管线，进度经 batch_state 轮询给前端
+#[tauri::command]
+async fn batch_export(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    output_dir: String,
+    runtime: String,
+    settings: RenderSettings,
+    output_ratio: Option<f64>,
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("没有选择视频".into());
+    }
+    std::fs::create_dir_all(&output_dir).map_err(|e| format!("无法创建输出文件夹: {e}"))?;
+    {
+        let mut batch = state.batch.lock().map_err(|_| "批量状态锁定失败")?;
+        if batch.running {
+            return Err("已有批量任务正在进行".into());
+        }
+        batch.running = true;
+        batch.cancelled = false;
+        batch.jobs = paths
+            .iter()
+            .map(|p| BatchJobProgress {
+                name: std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone()),
+                status: "pending".into(),
+                current: 0,
+                frames: 0,
+                fps: 0.0,
+                error: String::new(),
+            })
+            .collect();
+    }
+
+    let mut cancelled = false;
+    // 批量沿用主预览当前的放大倍率，逐视频按自身分辨率换算输出尺寸
+    let vsr_mode = settings.upscale == "vsr";
+    let upscale_ratio = match output_ratio {
+        Some(r) if vsr_mode && r > 1.0 => r.min(4.0),
+        _ => 1.0,
+    };
+    for (index, path) in paths.iter().enumerate() {
+        {
+            let mut batch = match state.batch.lock() {
+                Ok(b) => b,
+                Err(_) => return finish_batch(&state, cancelled),
+            };
+            if batch.cancelled {
+                for job in batch.jobs.iter_mut().skip(index) {
+                    if job.status == "pending" {
+                        job.status = "cancelled".into();
+                    }
+                }
+                cancelled = true;
+                break;
+            }
+            if let Some(job) = batch.jobs.get_mut(index) {
+                job.status = "running".into();
+            }
+        }
+        let source = std::path::Path::new(path);
+        let stem = source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("video{index}"));
+        let destination = unique_destination(std::path::Path::new(&output_dir), &stem);
+        // 放大倍率按每个视频自身的分辨率换算；越界与偶数化由导出管线兜底
+        let sizes = if upscale_ratio > 1.0 {
+            video_probe(path).map(|(sw, sh, _, _)| {
+                let w = ((sw as f64 * upscale_ratio).round() as u32).clamp(32, 8192) & !1;
+                let h = ((sh as f64 * upscale_ratio).round() as u32).clamp(32, 8192) & !1;
+                (Some(w), Some(h))
+            })
+        } else {
+            Ok((None, None))
+        };
+        let start = std::time::Instant::now();
+        let result = match sizes {
+            Err(e) => Err(e),
+            Ok((out_w, out_h)) => export_one_video(
+                &state,
+                path,
+                &destination.to_string_lossy(),
+                &runtime,
+                &settings,
+                out_w,
+                out_h,
+                &mut |current, frames, _message| {
+                    if let Ok(mut batch) = state.batch.lock() {
+                        if let Some(job) = batch.jobs.get_mut(index) {
+                            job.current = current;
+                            job.frames = frames;
+                            let elapsed = start.elapsed().as_secs_f64();
+                            job.fps = if elapsed > 0.3 {
+                                (current as f64 / elapsed * 10.0).round() / 10.0
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                },
+                &|| state.batch.lock().map(|b| b.cancelled).unwrap_or(false),
+            ),
+        };
+        if let Ok(mut batch) = state.batch.lock() {
+            if let Some(job) = batch.jobs.get_mut(index) {
+                match &result {
+                    Ok(_) => job.status = "done".into(),
+                    Err(e) if e == BATCH_CANCELLED => {
+                        job.status = "cancelled".into();
+                        job.error = BATCH_CANCELLED.into();
+                    }
+                    Err(e) => {
+                        job.status = "failed".into();
+                        job.error = e.clone();
+                    }
+                }
+            }
+        }
+        match &result {
+            Err(e) if e == BATCH_CANCELLED => {
+                cancelled = true;
+                if let Ok(mut batch) = state.batch.lock() {
+                    for job in batch.jobs.iter_mut().skip(index + 1) {
+                        if job.status == "pending" {
+                            job.status = "cancelled".into();
+                        }
+                    }
+                }
+                break;
+            }
+            // 失败与取消都清理半成品文件（取消的已由导出管线删除，此处兜底）
+            Err(_) => {
+                let _ = std::fs::remove_file(&destination);
+            }
+            Ok(_) => {}
+        }
+    }
+    finish_batch(&state, cancelled)
+}
+
+fn finish_batch(state: &AppState, cancelled: bool) -> Result<(), String> {
+    let mut batch = state.batch.lock().map_err(|_| "批量状态锁定失败")?;
+    batch.running = false;
+    batch.cancelled = cancelled;
+    Ok(())
+}
+
+#[tauri::command]
+fn batch_state(state: tauri::State<'_, AppState>) -> BatchProgress {
+    state.batch.lock().map(|b| b.clone()).unwrap_or_default()
+}
+
+#[tauri::command]
+fn batch_cancel(state: tauri::State<'_, AppState>) {
+    if let Ok(mut batch) = state.batch.lock() {
+        batch.cancelled = true;
+    }
 }
 
 #[cfg(test)]
@@ -1952,6 +2246,7 @@ fn main() {
                 }),
                 export_paused: AtomicBool::new(false),
                 export_cancel: AtomicBool::new(false),
+                batch: Mutex::new(BatchProgress::default()),
             });
             Ok(())
         })
@@ -1972,6 +2267,11 @@ fn main() {
             frame_png,
             render_frame_png,
             export_video,
+            batch_export,
+            batch_state,
+            batch_cancel,
+            choose_media_multi,
+            choose_directory,
             vsr_probe
         ])
         .run(tauri::generate_context!())
