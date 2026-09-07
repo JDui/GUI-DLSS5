@@ -87,6 +87,3 @@ function applyRatio(k) {
 $('ratio-1').onclick = () => applyRatio(1);
 $('ratio-2').onclick = () => applyRatio(2);
 $('ratio-4').onclick = () => applyRatio(4);
-
-const previewNote = document.querySelector('.card-head b small');
-if (previewNote) previewNote.textContent = '预览按窗口分辨率渲染；导出按输出尺寸设置处理';

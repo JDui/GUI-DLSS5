@@ -612,7 +612,7 @@ fn preview_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u32) {
     }
 }
 
-// 输出尺寸约束：32..=8192 且取偶（视频 yuv420p 编码要求），越界时按比例整体缩放
+// 输出尺寸约束：32..=8192 且取偶（视频编码要求），越界时按比例整体缩放
 fn sanitize_output(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
     let (width, height) = (width?, height?);
     if width == 0 || height == 0 {
@@ -1590,23 +1590,30 @@ fn nvenc_available(encoder: &str) -> bool {
         .unwrap_or(false)
 }
 
-// 解析编码器设置：NVENC 不可用时回退对应的 CPU 编码器，返回 (ffmpeg 编码器名, 是否硬件)
-fn resolve_encoder(requested: &str) -> (&'static str, bool) {
+// 解析编码器设置：NVENC 不可用时回退对应的 CPU 编码器，返回 (ffmpeg 编码器名, 是否硬件, 是否无损)
+fn resolve_encoder(requested: &str) -> (&'static str, bool, bool) {
     match requested {
         "h265_nvenc" => {
             if nvenc_available("hevc_nvenc") {
-                ("hevc_nvenc", true)
+                ("hevc_nvenc", true, false)
             } else {
-                ("libx265", false)
+                ("libx265", false, false)
             }
         }
-        "h264_x264" => ("libx264", false),
-        "h265_x265" => ("libx265", false),
+        "h265_nvenc_lossless" => {
+            if nvenc_available("hevc_nvenc") {
+                ("hevc_nvenc", true, true)
+            } else {
+                ("libx265", false, true)
+            }
+        }
+        "h264_x264" => ("libx264", false, false),
+        "h265_x265" => ("libx265", false, false),
         _ => {
             if nvenc_available("h264_nvenc") {
-                ("h264_nvenc", true)
+                ("h264_nvenc", true, false)
             } else {
-                ("libx264", false)
+                ("libx264", false, false)
             }
         }
     }
@@ -1674,7 +1681,7 @@ fn export_one_video(
     let (decode_w, decode_h) = if bypass { (source_w, source_h) } else { (w, h) };
     let quality = settings.encoder_quality.clamp(0, 51);
     let quality_s = quality.to_string();
-    let (encoder, hw) = resolve_encoder(&settings.encoder);
+    let (encoder, hw, lossless) = resolve_encoder(&settings.encoder);
     // NVENC 分辨率上限：H.264 4096×4096，H.265 8192×8192
     if hw && encoder == "h264_nvenc" && (w > 4096 || h > 4096) {
         return Err(format!(
@@ -1686,11 +1693,17 @@ fn export_one_video(
             "H.265 (NVENC) 最高支持 8192×8192，当前输出 {w}×{h}。"
         ));
     }
-    let label = match encoder {
-        "h264_nvenc" => "H.264 NVENC".to_string(),
-        "hevc_nvenc" => "H.265 NVENC".to_string(),
-        "libx264" => "H.264 x264 (CPU)".to_string(),
-        _ => "H.265 x265 (CPU)".to_string(),
+    let label = if lossless && hw {
+        "H.265 / HEVC NVENC Lossless".to_string()
+    } else if lossless {
+        "H.265 / HEVC Lossless (CPU fallback)".to_string()
+    } else {
+        match encoder {
+            "h264_nvenc" => "H.264 NVENC".to_string(),
+            "hevc_nvenc" => "H.265 NVENC".to_string(),
+            "libx264" => "H.264 x264 (CPU)".to_string(),
+            _ => "H.265 x265 (CPU)".to_string(),
+        }
     };
     on_progress(0, total_frames, format!("使用 {label}，正在导出 {w}×{h}…"));
     let result: Result<u32, String> = (|| {
@@ -1733,8 +1746,32 @@ fn export_one_video(
             } else {
                 Vec::new()
             })
-            .args(["-pix_fmt", "yuv420p"])
-            .args(if hw {
+            .args(["-pix_fmt", if lossless { "gbrp" } else { "yuv420p" }])
+            .args(if lossless && hw {
+                vec![
+                    "-profile:v",
+                    "rext",
+                    "-c:v",
+                    encoder,
+                    "-tune",
+                    "lossless",
+                    "-rc",
+                    "constqp",
+                    "-qp",
+                    "0",
+                ]
+            } else if lossless {
+                vec![
+                    "-c:v",
+                    encoder,
+                    "-preset",
+                    "veryfast",
+                    "-x265-params",
+                    "lossless=1",
+                    "-crf",
+                    "0",
+                ]
+            } else if hw {
                 vec![
                     "-c:v",
                     encoder,

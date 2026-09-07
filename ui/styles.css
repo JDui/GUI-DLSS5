@@ -27,6 +27,13 @@ body{margin:0;background:var(--bg);color:var(--text);font:13px/1.5 "Segoe UI","M
 .app{min-height:100vh;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
 .import,footer,.card-head,.transport{display:flex;align-items:center;gap:10px}
 .runtime{margin-left:auto;display:flex;gap:8px;align-items:center}
+.language-control{display:flex;align-items:center;gap:7px;margin-left:2px;white-space:nowrap}
+.language-label{color:var(--muted);font-size:12px}
+#language-switch{position:relative;display:inline-flex;align-items:center;padding:3px;border:1px solid var(--edge);border-radius:999px;background:var(--field)}
+#language-switch .language-option{position:relative;z-index:1;border:none;background:transparent;border-radius:999px;padding:3px 9px;color:var(--muted);font-size:12px;font-weight:600;box-shadow:none}
+#language-switch .language-option:hover{background:transparent;color:var(--text)}
+#language-switch .language-option.active{color:var(--on-accent)}
+#language-thumb{position:absolute;z-index:0;top:3px;bottom:3px;left:3px;width:0;border-radius:999px;background:var(--accent);transition:left .18s ease,width .18s ease}
 
 /* 面板：无描边，靠底色与间距分组 */
 .import,footer,.settings,.log,.preview-card{background:var(--panel);border:none;border-radius:6px;padding:10px 12px}
@@ -87,8 +94,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
 /* 侧栏与标签页 */
 aside{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
-.tabs{display:flex;gap:14px;padding:0 4px;border-bottom:1px solid var(--line);position:relative;z-index:1}
-.tabs .tab{flex:1;padding:8px 4px;background:transparent;color:var(--muted);border:none;border-bottom:2px solid transparent;border-radius:0;font-weight:600;font-size:12.5px;letter-spacing:.05em;white-space:nowrap}
+.tabs{display:flex;min-width:0;gap:4px;padding:0 3px;border-bottom:1px solid var(--line);position:relative;z-index:1}
+.tabs .tab{flex:1 1 0;min-width:0;overflow:hidden;padding:8px 2px;background:transparent;color:var(--muted);border:none;border-bottom:2px solid transparent;border-radius:0;font-weight:600;font-size:12px;letter-spacing:0;white-space:nowrap;text-overflow:ellipsis}
 .tabs .tab:hover{color:var(--text);background:transparent}
 .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);background:transparent}
 .tab-page{border-radius:6px}
@@ -111,6 +118,7 @@ input[type=range]:hover::-webkit-slider-thumb{background:var(--accent-strong)}
 input[type=range]::-moz-range-track{height:3px;border-radius:2px;background:#3f3f3f}
 input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:var(--accent);border:none}
 input[type=checkbox]{accent-color:var(--accent)}
+input:disabled{opacity:.45;cursor:not-allowed}
 
 footer{padding:9px 12px}
 footer #status{margin-left:auto;color:var(--muted)}
@@ -151,6 +159,7 @@ footer #status{margin-left:auto;color:var(--muted)}
 footer .export-progress[hidden]{display:none}
 #export-pause,#export-cancel{flex:none;padding:4px 10px;font-size:12px;font-weight:600}
 
+@media(max-width:1100px){.import{flex-wrap:wrap}.runtime{margin-left:auto}.language-control{margin-left:auto}}
 @media(max-width:900px){.workspace{grid-template-columns:1fr}.preview-card{min-height:400px}aside{max-height:460px}.transport span,.card-head small{display:none}}
 
 /* 批量处理弹窗 */
