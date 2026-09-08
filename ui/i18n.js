@@ -5,7 +5,7 @@
 
   const messages = {
     zh: {
-      'app.title': 'DLSS5 Neural Render v0.1.24',
+      'app.title': 'DLSS5 Neural Render v0.1.26',
       'language.label': '语言',
       'language.zh': '中文',
       'language.en': 'English',
@@ -203,7 +203,7 @@
       'tips.uiCorrection': '开关：针对画面中的界面元素（字幕、HUD、水印等）\n做修正与保留，减轻神经渲染对这类规则图形的涂抹。\n对不含界面元素的素材基本无影响。'
     },
     en: {
-      'app.title': 'DLSS5 Neural Render v0.1.24',
+      'app.title': 'DLSS5 Neural Render v0.1.26',
       'language.label': 'Language',
       'language.zh': '中文',
       'language.en': 'English',
@@ -401,7 +401,7 @@
       'tips.uiCorrection': 'Preserves interface elements such as subtitles, HUDs, and watermarks,\nreducing the smearing caused by neural rendering on regular graphics.\nIt has little effect on content without UI elements.'
     },
     ja: {
-      'app.title': 'DLSS5 Neural Render v0.1.24',
+      'app.title': 'DLSS5 Neural Render v0.1.26',
       'language.label': '言語',
       'language.zh': '中文',
       'language.en': 'English',

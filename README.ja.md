@@ -1,4 +1,4 @@
-# DLSS5 Neural Render v0.1.24
+# DLSS5 Neural Render v0.1.26
 
 [中文](README.md) · [English](README.en.md) · [日本語](README.ja.md)
 

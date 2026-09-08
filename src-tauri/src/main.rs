@@ -566,6 +566,16 @@ fn probe_f64(value: &serde_json::Value) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+// rawvideo 管道不携带时间戳。优先用同一视频流的总帧数/时长还原平均帧率，
+// 避免错误或不一致的 avg_frame_rate 元数据让成片加速或减速。
+fn normalized_video_fps(frames: Option<u32>, duration: Option<f64>, fallback: f64) -> f64 {
+    frames
+        .zip(duration)
+        .map(|(frames, seconds)| frames as f64 / seconds)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(fallback)
+}
+
 fn video_probe(path: &str) -> Result<(u32, u32, u32, f64), String> {
     let out = tool("ffprobe")?
         .args([
@@ -589,10 +599,12 @@ fn video_probe(path: &str) -> Result<(u32, u32, u32, f64), String> {
     let stream = value["streams"].get(0).cloned().ok_or("没有视频流")?;
     let width = stream["width"].as_u64().ok_or("无效视频宽度")? as u32;
     let height = stream["height"].as_u64().ok_or("无效视频高度")? as u32;
-    let fps = probe_fps(&stream);
+    let declared_fps = probe_fps(&stream);
     let duration =
         probe_f64(&stream["duration"]).or_else(|| probe_f64(&value["format"]["duration"]));
-    let frames = probe_u32(&stream["nb_frames"])
+    let reported_frames = probe_u32(&stream["nb_frames"]);
+    let fps = normalized_video_fps(reported_frames, duration, declared_fps);
+    let frames = reported_frames
         .or_else(|| duration.map(|seconds| (seconds * fps).round().max(1.0) as u32))
         .unwrap_or(1)
         .max(1);
@@ -1709,13 +1721,25 @@ fn export_one_video(
     let result: Result<u32, String> = (|| {
         let frame_bytes = (decode_w * decode_h * 4) as usize;
         let scale_filter = format!("scale={w}:{h}:flags=lanczos");
+        // 处理前显式归一化帧率。这样 rawvideo 的帧数与编码器的时间轴一致，
+        // 同时仍按输入视频的实际时长处理可变帧率素材。
+        let decode_filter = if !bypass && (w, h) != (source_w, source_h) {
+            format!("{scale_filter},fps=fps={fps}:round=near")
+        } else {
+            format!("fps=fps={fps}:round=near")
+        };
         let mut command = tool("ffmpeg")?;
         command.args(["-v", "error", "-i", &path]);
-        if !bypass && (w, h) != (source_w, source_h) {
-            command.args(["-vf", &scale_filter]);
-        }
         let mut decode = command
-            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .args([
+                "-vf",
+                &decode_filter,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1742,7 +1766,19 @@ fn export_one_video(
                 "0:v",
             ])
             .args(if settings.keep_audio {
-                vec!["-map", "1:a?", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+                // 保留音轨时补齐较短的音轨；-shortest 因而始终以处理后视频的结尾为准，
+                // 不会因为音轨较短而截断视频。
+                vec![
+                    "-map",
+                    "1:a?",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-af",
+                    "apad",
+                    "-shortest",
+                ]
             } else {
                 Vec::new()
             })
@@ -2173,6 +2209,19 @@ fn batch_cancel(state: tauri::State<'_, AppState>) {
 #[cfg(test)]
 mod render_order_tests {
     use super::*;
+
+    #[test]
+    fn uses_frame_count_and_duration_to_preserve_raw_video_timing() {
+        // A broken nominal FPS must not shrink 2,460 frames from 73 seconds to 41 seconds.
+        let fps = normalized_video_fps(Some(2_460), Some(73.0), 60.0);
+        assert!((fps - (2_460.0 / 73.0)).abs() < f64::EPSILON);
+        assert!(((2_460.0 / fps) - 73.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn uses_declared_fps_when_frame_timing_is_unavailable() {
+        assert_eq!(normalized_video_fps(None, Some(73.0), 29.97), 29.97);
+    }
 
     #[test]
     fn defers_vsr_only_for_a_real_multi_pass_upscale() {

@@ -120,8 +120,8 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 input[type=checkbox]{accent-color:var(--accent)}
 input:disabled{opacity:.45;cursor:not-allowed}
 
-footer{padding:9px 12px}
-footer #status{margin-left:auto;color:var(--muted)}
+footer{padding:9px 12px;flex-wrap:wrap}
+footer #status{margin-left:auto;min-width:0;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* 开关（多重 Pass） */
 .param-title{display:flex;align-items:center;gap:5px}
@@ -153,13 +153,14 @@ footer #status{margin-left:auto;color:var(--muted)}
 .tab-page .control select{width:100%}
 
 /* 导出进度 */
-.export-progress{display:flex;align-items:center;gap:8px;flex:1;min-width:220px;max-width:560px}
-.export-progress progress{width:100%;height:8px;accent-color:var(--accent)}
-.export-progress span{min-width:112px;color:var(--muted);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.export-progress{display:flex;align-items:center;gap:8px;flex:1 1 360px;min-width:360px;max-width:560px}
+.export-progress progress{flex:1 1 80px;min-width:80px;width:auto;height:8px;accent-color:var(--accent)}
+.export-progress span{flex:none;min-width:112px;color:var(--muted);font-size:12px;white-space:nowrap;font-variant-numeric:tabular-nums}
 footer .export-progress[hidden]{display:none}
 #export-pause,#export-cancel{flex:none;padding:4px 10px;font-size:12px;font-weight:600}
 
 @media(max-width:1100px){.import{flex-wrap:wrap}.runtime{margin-left:auto}.language-control{margin-left:auto}}
+@media(max-width:1280px){footer .export-progress{order:2;flex-basis:100%;max-width:none}footer #status{order:3;flex-basis:100%;margin-left:0;text-align:right}}
 @media(max-width:900px){.workspace{grid-template-columns:1fr}.preview-card{min-height:400px}aside{max-height:460px}.transport span,.card-head small{display:none}}
 
 /* 批量处理弹窗 */
