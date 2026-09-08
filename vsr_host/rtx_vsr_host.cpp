@@ -352,7 +352,7 @@ extern "C" __declspec(dllexport) int vsr_upscale(const unsigned char* src, int s
 
     {
         uint8_t* mapped = nullptr;
-        if (FAILED(sf.upload->Map(0, nullptr, (void**)&mapped))) return 0;
+        if (FAILED(sf.upload->Map(0, nullptr, (void**)&mapped)) || !mapped) return 0;
         for (int y = 0; y < sh; ++y)
             memcpy(mapped + (UINT64)y * sf.inPitch, src + (UINT64)y * sw * 4, (UINT64)sw * 4);
         sf.upload->Unmap(0, nullptr);
@@ -426,7 +426,7 @@ extern "C" __declspec(dllexport) int vsr_upscale(const unsigned char* src, int s
 
     {
         uint8_t* mapped = nullptr;
-        if (FAILED(sf.readback->Map(0, nullptr, (void**)&mapped))) return 0;
+        if (FAILED(sf.readback->Map(0, nullptr, (void**)&mapped)) || !mapped) return 0;
         for (int y = 0; y < dh; ++y)
             memcpy(dst + (UINT64)y * dw * 4, mapped + (UINT64)y * sf.outPitch, (UINT64)dw * 4);
         sf.readback->Unmap(0, nullptr);
