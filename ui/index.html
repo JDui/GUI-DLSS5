@@ -1,21 +1,294 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>DLSS5 Neural Render v0.1.15</title><link rel="stylesheet" href="styles.css"/><link rel="stylesheet" href="compare.css"/></head>
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title data-i18n="app.title">DLSS5 Neural Render v0.1.26</title>
+  <link rel="stylesheet" href="styles.css"/>
+  <link rel="stylesheet" href="compare.css"/>
+</head>
 <body>
   <main class="app">
-    <section class="import"><b>素材</b><button id="open" class="primary">＋ 导入图片 / 视频</button><button id="paste">粘贴图片</button><span id="source">尚未选择图片或视频</span><div class="runtime"><label>显卡</label><span id="gpu-name" class="gpu-name">检测中…</span><label>运行时</label><select id="runtime"><option value="50">RTX 50（原生）</option><option value="40">RTX 40（兼容）</option><option value="30">RTX 30（兼容）</option></select></div></section>
-    <section class="workspace"><article class="preview-card"><div class="card-head"><b>实时预览 <small>预览按窗口分辨率渲染；导出保持原始分辨率</small></b><button id="zoom">适合窗口</button></div><div id="stage" tabindex="0"><img id="preview" alt="预览画面"/><div id="original-mask"><img id="original-preview" alt="原图"/></div><div id="ab-view"><div class="ab-pane"><img id="ab-original" alt="原图"/></div><div class="ab-pane"><img id="ab-processed" alt="DLSS 画面"/></div></div><div id="empty"><strong>拖入、粘贴或导入图片 / 视频开始预览</strong><small>支持 PNG / JPG / GIF / MP4 / AVI / MOV / MKV 等格式</small></div><div id="compare-left" class="compare-label">原图</div><div id="compare-right" class="compare-label">DLSS</div><div id="split-line"></div></div><div class="timeline"><input id="frame" type="range" min="0" max="0" value="0"/><span id="frame-label">帧 0 / 0</span></div><div class="transport"><label>显示</label><div id="view-switch"><span id="view-thumb"></span><button type="button" class="view-opt active" data-view="快速比对">快速比对</button><button type="button" class="view-opt" data-view="对比">对比</button><button type="button" class="view-opt" data-view="AB 视图">AB 视图</button></div><select id="view" hidden><option>快速比对</option><option>对比</option><option>AB 视图</option></select><label id="ab-option">AB <select id="ab-layout"><option value="horizontal">左右并排</option><option value="vertical">上下堆叠</option></select></label><button id="play">▶ 播放</button><span id="hint">按住左键查看原图 · 中键 / 右键拖动画面</span></div></article>
-      <aside><nav class="tabs"><button class="tab active" data-tab="dlss">DLSS 参数</button><button class="tab" data-tab="upscale">放大</button><button class="tab" data-tab="post">后处理</button><button class="tab" data-tab="encoder">编码器</button></nav><section class="settings tab-page" id="tab-dlss"><h2>DLSS 参数</h2><label class="multi-pass-toggle"><span>多重Pass模式</span><input id="multi-pass" class="pill-switch" type="checkbox" role="switch" aria-controls="pass-control"/></label><div class="control" id="pass-control" hidden><b><label for="pass-count">Pass数</label></b><input id="pass-count-num" type="number" min="1" max="5" step="1" value="2" aria-label="Pass数数值"/><small>总共处理 1–5 次，每次沿用下方参数</small><input id="pass-count" type="range" min="1" max="5" step="1" value="2" list="pass-steps"/><datalist id="pass-steps"><option value="1"></option><option value="2"></option><option value="3"></option><option value="4"></option><option value="5"></option></datalist><div class="pass-ticks" aria-hidden="true"><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span></div></div><label><span class="param-title">渲染风格<span class="info" data-param="style">i</span></span><select id="style"><option value="0">默认</option><option value="1">自然</option><option value="2">电影</option><option value="3">风格 3</option></select></label><div class="control"><b>处理强度<span class="info" data-param="intensity">i</span></b><input id="intensity-num" type="number" min="0" max="1" step="0.001" value="1"/><small>控制 DLSS 效果的整体权重</small><input id="intensity" type="range" min="0" max="1" step="0.001" value="1"/></div><div class="control"><b>本地色调<span class="info" data-param="tone">i</span></b><input id="tone-num" type="number" min="0" max="1" step="0.001" value="1"/><small>保留局部明暗与色彩变化</small><input id="tone" type="range" min="0" max="1" step="0.001" value="1"/></div><div class="control"><b>本地结构<span class="info" data-param="struct">i</span></b><input id="struct-num" type="number" min="0" max="1" step="0.001" value="1"/><small>保留局部边缘与纹理细节</small><input id="struct" type="range" min="0" max="1" step="0.001" value="1"/></div><div class="control"><b>皮肤结构<span class="info" data-param="skin">i</span></b><input id="skin-num" type="number" min="0" max="1" step="0.001" value="1"/><small>控制皮肤区域的结构增强权重</small><input id="skin" type="range" min="0" max="1" step="0.001" value="1"/></div><div class="control"><b>使用自动掩码<span class="info" data-param="autoMask">i</span></b><input id="auto-mask" type="checkbox"/><small>让 DLSS 自动识别需要保护的区域</small></div><div class="control"><b>UI 修正<span class="info" data-param="uiCorrection">i</span></b><input id="ui-correction" type="checkbox"/><small>尝试保留界面元素，效果取决于输入内容</small></div></section><section class="settings tab-page" id="tab-upscale" hidden><h2>放大</h2><div class="out-size"><b>输出尺寸<small id="size-note"></small></b><span class="size-fields" title="自定义输出分辨率；预览最长边仍限制为 2160，导出按此尺寸处理"><input id="out-width" type="number" min="32" max="8192" step="2" placeholder="宽"/><i>×</i><input id="out-height" type="number" min="32" max="8192" step="2" placeholder="高"/></span><span class="ratio-row"><button id="ratio-1" title="按原始尺寸输出">X1</button><button id="ratio-2" title="按原始尺寸的 2 倍输出">X2</button><button id="ratio-4" title="按原始尺寸的 4 倍输出">X4</button></span></div><label><span class="param-title">放大引擎</span><select id="upscale"><option value="none">关闭（不放大）</option><option value="vsr" selected>RTX VSR</option></select></label><small class="hint">放大依赖 RTX VSR（NVIDIA 网络超分）：需 RTX 20 系及以上显卡与 550+ 驱动，程序目录需带 nvngx_vsr.dll 与 rtx_vsr_host.dll。关闭或不可用时，导出不会超过原始分辨率，X2 / X4 按钮也会禁用。</small><div class="control"><b>VSR 质量</b><select id="vsr-quality"><option value="1">1 低（最快）</option><option value="2">2 中</option><option value="3">3 高</option><option value="4" selected>4 超高（最佳）</option></select><small>档位越高细节越好、耗时越长</small></div><div class="control"><b>插帧</b><select id="interp"><option value="1">关闭</option><option value="2" selected>2x</option><option value="3">3x</option><option value="4">4x</option></select><small>用 RIFE v4.6 在帧间生成中间帧（导出时生效）</small><small id="interp-note"></small></div><small class="hint">对比视图中的“原图”侧以最近邻放大展示原始像素，便于与放大 + DLSS 后的效果对比。</small></section><section class="settings tab-page" id="tab-post" hidden><h2>后处理</h2><div class="control"><b>亮度</b><input id="post-brightness-num" type="number" min="0" max="2" step="0.05" value="1"/><small>0–2，默认 1 不变</small><input id="post-brightness" type="range" min="0" max="2" step="0.01" value="1"/></div><div class="control"><b>对比度</b><input id="post-contrast-num" type="number" min="0" max="2" step="0.05" value="1"/><small>0–2，默认 1 不变</small><input id="post-contrast" type="range" min="0" max="2" step="0.01" value="1"/></div><div class="control"><b>饱和度</b><input id="post-saturation-num" type="number" min="0" max="2" step="0.05" value="1"/><small>0–2，默认 1 不变</small><input id="post-saturation" type="range" min="0" max="2" step="0.01" value="1"/></div><div class="control"><b>多Pass逐轮应用</b><input id="post-per-pass" type="checkbox" checked/><small>开启时每轮 DLSS Pass 后应用后处理；关闭时仅在最后一轮后应用</small></div><small class="hint">以上后处理对预览和导出均生效。</small></section><section class="settings tab-page" id="tab-encoder" hidden><h2>编码器</h2><label><span class="param-title">编码器</span><select id="encoder"><option value="h264_nvenc">H.264 · NVENC（GPU）</option><option value="h265_nvenc" selected>H.265 · NVENC（GPU）</option><option value="h264_x264">H.264 · x264（CPU）</option><option value="h265_x265">H.265 · x265（CPU）</option></select></label><small class="hint">H.264 NVENC 最高支持 4096×4096，更大的输出请改用 H.265；NVENC 不可用时会自动改用对应的 CPU 编码器。</small><div class="control"><b>质量</b><input id="encoder-quality" type="number" min="0" max="51" step="1" value="23"/><small>数值越低画质越高（CQ / CRF），常用 18–28</small></div><div class="control"><b>保持音频</b><input id="keep-audio" type="checkbox" checked/><small>导出视频时附带原视频的音轨（转为 AAC）</small></div></section></aside></section>
-    <footer><button id="export-current">导出当前画面</button><button id="export-full" class="primary">导出 DLSS 视频</button><button id="batch-open">批量处理</button><button id="copy">复制当前画面</button><div id="export-progress-wrap" class="export-progress" hidden><progress id="export-progress" max="1" value="0"></progress><span id="export-progress-label">准备导出…</span><button id="export-pause" hidden>暂停</button><button id="export-cancel" hidden>取消</button></div><span id="status">就绪</span></footer>
+    <section class="import">
+      <b data-i18n="import.media">素材</b>
+      <button id="open" class="primary" data-i18n="import.open">＋ 导入图片 / 视频</button>
+      <button id="paste" data-i18n="import.paste">粘贴图片</button>
+      <span id="source" data-i18n="source.empty">尚未选择图片或视频</span>
+      <div class="runtime">
+        <label data-i18n="gpu.label">显卡</label>
+        <span id="gpu-name" class="gpu-name">检测中…</span>
+        <label data-i18n="runtime.label">运行时</label>
+        <select id="runtime">
+          <option value="50" data-i18n="runtime.50">RTX 50（原生）</option>
+          <option value="40" data-i18n="runtime.40">RTX 40（兼容）</option>
+          <option value="30" data-i18n="runtime.30">RTX 30（兼容）</option>
+        </select>
+      </div>
+      <div class="language-control">
+        <span class="language-label" data-i18n="language.label">语言</span>
+        <div id="language-switch" role="group" data-i18n-aria-label="language.label" aria-label="语言">
+          <span id="language-thumb"></span>
+          <button type="button" class="language-option" data-language="zh" data-i18n="language.zh">中文</button>
+          <button type="button" class="language-option" data-language="en" data-i18n="language.en">English</button>
+          <button type="button" class="language-option" data-language="ja" data-i18n="language.ja">日本語</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <article class="preview-card">
+        <div class="card-head">
+          <b><span data-i18n="preview.title">实时预览</span><small data-i18n="preview.subtitle">预览按窗口分辨率渲染；导出保持输出分辨率</small></b>
+          <button id="zoom" data-i18n="preview.fit">适合窗口</button>
+        </div>
+        <div id="stage" tabindex="0">
+          <img id="preview" data-i18n-alt="alt.preview" alt="预览画面"/>
+          <div id="original-mask"><img id="original-preview" data-i18n-alt="alt.original" alt="原图"/></div>
+          <div id="ab-view">
+            <div class="ab-pane"><img id="ab-original" data-i18n-alt="alt.original" alt="原图"/></div>
+            <div class="ab-pane"><img id="ab-processed" data-i18n-alt="alt.processed" alt="DLSS 画面"/></div>
+          </div>
+          <div id="empty">
+            <strong data-i18n="empty.title">拖入、粘贴或导入图片 / 视频开始预览</strong>
+            <small data-i18n="empty.formats">支持 PNG / JPG / GIF / MP4 / AVI / MOV / MKV 等格式</small>
+          </div>
+          <div id="compare-left" class="compare-label" data-i18n="compare.original">原图</div>
+          <div id="compare-right" class="compare-label" data-i18n="compare.dlss">DLSS</div>
+          <div id="split-line"></div>
+        </div>
+        <div class="timeline">
+          <input id="frame" type="range" min="0" max="0" value="0"/>
+          <span id="frame-label">帧 0 / 0</span>
+        </div>
+        <div class="transport">
+          <label data-i18n="display.label">显示</label>
+          <div id="view-switch" role="group" data-i18n-aria-label="display.label" aria-label="显示">
+            <span id="view-thumb"></span>
+            <button type="button" class="view-opt active" data-view="quick" data-i18n="view.quick">快速比对</button>
+            <button type="button" class="view-opt" data-view="compare" data-i18n="view.compare">对比</button>
+            <button type="button" class="view-opt" data-view="ab" data-i18n="view.ab">AB 视图</button>
+          </div>
+          <select id="view" hidden>
+            <option value="quick" data-i18n="view.quick">快速比对</option>
+            <option value="compare" data-i18n="view.compare">对比</option>
+            <option value="ab" data-i18n="view.ab">AB 视图</option>
+          </select>
+          <label id="ab-option"><span data-i18n="ab.label">AB</span>
+            <select id="ab-layout">
+              <option value="horizontal" data-i18n="ab.horizontal">左右并排</option>
+              <option value="vertical" data-i18n="ab.vertical">上下堆叠</option>
+            </select>
+          </label>
+          <button id="play" data-i18n="play.play">▶ 播放</button>
+          <span id="hint">按住左键查看原图 · 中键 / 右键拖动画面</span>
+        </div>
+      </article>
+
+      <aside>
+        <nav class="tabs">
+          <button class="tab active" data-tab="dlss" data-i18n="tabs.dlss" data-i18n-title="dlss.title" title="DLSS 参数">DLSS 参数</button>
+          <button class="tab" data-tab="upscale" data-i18n="tabs.upscale" data-i18n-title="upscale.title" title="放大">放大</button>
+          <button class="tab" data-tab="post" data-i18n="tabs.post" data-i18n-title="post.title" title="后处理">后处理</button>
+          <button class="tab" data-tab="encoder" data-i18n="tabs.encoder" data-i18n-title="encoder.title" title="编码器">编码器</button>
+        </nav>
+
+        <section class="settings tab-page" id="tab-dlss">
+          <h2 data-i18n="dlss.title">DLSS 参数</h2>
+          <label class="multi-pass-toggle">
+            <span data-i18n="multiPass.label">多重 Pass 模式</span>
+            <input id="multi-pass" class="pill-switch" type="checkbox" role="switch" aria-controls="pass-control"/>
+          </label>
+          <div class="control" id="pass-control" hidden>
+            <b><label for="pass-count" data-i18n="pass.label">Pass 数</label></b>
+            <input id="pass-count-num" type="number" min="1" max="5" step="1" value="2" data-i18n-aria-label="pass.aria" aria-label="Pass 数值"/>
+            <small data-i18n="pass.help">总共处理 1–5 次，每次沿用下方参数</small>
+            <input id="pass-count" type="range" min="1" max="5" step="1" value="2" list="pass-steps"/>
+            <datalist id="pass-steps"><option value="1"></option><option value="2"></option><option value="3"></option><option value="4"></option><option value="5"></option></datalist>
+            <div class="pass-ticks" aria-hidden="true"><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span></div>
+          </div>
+          <label>
+            <span class="param-title"><span data-i18n="style.label">渲染风格</span><span class="info" data-param="style">i</span></span>
+            <select id="style">
+              <option value="0" data-i18n="style.default">默认</option>
+              <option value="1" data-i18n="style.natural">自然</option>
+              <option value="2" data-i18n="style.cinema">电影</option>
+              <option value="3" data-i18n="style.experimental">风格 3</option>
+            </select>
+          </label>
+          <div class="control">
+            <b><span data-i18n="intensity.label">处理强度</span><span class="info" data-param="intensity">i</span></b>
+            <input id="intensity-num" type="number" min="0" max="1" step="0.001" value="1"/>
+            <small data-i18n="intensity.hint">控制 DLSS 效果的整体权重</small>
+            <input id="intensity" type="range" min="0" max="1" step="0.001" value="1"/>
+          </div>
+          <div class="control">
+            <b><span data-i18n="tone.label">本地色调</span><span class="info" data-param="tone">i</span></b>
+            <input id="tone-num" type="number" min="0" max="1" step="0.001" value="1"/>
+            <small data-i18n="tone.hint">保留局部明暗与色彩变化</small>
+            <input id="tone" type="range" min="0" max="1" step="0.001" value="1"/>
+          </div>
+          <div class="control">
+            <b><span data-i18n="struct.label">本地结构</span><span class="info" data-param="struct">i</span></b>
+            <input id="struct-num" type="number" min="0" max="1" step="0.001" value="1"/>
+            <small data-i18n="struct.hint">保留局部边缘与纹理细节</small>
+            <input id="struct" type="range" min="0" max="1" step="0.001" value="1"/>
+          </div>
+          <div class="control">
+            <b><span data-i18n="skin.label">皮肤结构</span><span class="info" data-param="skin">i</span></b>
+            <input id="skin-num" type="number" min="0" max="1" step="0.001" value="1"/>
+            <small data-i18n="skin.hint">控制皮肤区域的结构增强权重</small>
+            <input id="skin" type="range" min="0" max="1" step="0.001" value="1"/>
+          </div>
+          <div class="control">
+            <b><span data-i18n="autoMask.label">使用自动掩码</span><span class="info" data-param="autoMask">i</span></b>
+            <input id="auto-mask" type="checkbox"/>
+            <small data-i18n="autoMask.hint">让 DLSS 自动识别需要保护的区域</small>
+          </div>
+          <div class="control">
+            <b><span data-i18n="uiCorrection.label">UI 修正</span><span class="info" data-param="uiCorrection">i</span></b>
+            <input id="ui-correction" type="checkbox"/>
+            <small data-i18n="uiCorrection.hint">尝试保留界面元素，效果取决于输入内容</small>
+          </div>
+        </section>
+
+        <section class="settings tab-page" id="tab-upscale" hidden>
+          <h2 data-i18n="upscale.title">放大</h2>
+          <div class="out-size">
+            <b><span data-i18n="output.size">输出尺寸</span><small id="size-note"></small></b>
+            <span class="size-fields" data-i18n-title="output.customTitle" title="自定义输出分辨率；预览任一单边最高 4520，导出按此尺寸处理">
+              <input id="out-width" type="number" min="32" max="8192" step="2" data-i18n-placeholder="output.width" placeholder="宽"/>
+              <i>×</i>
+              <input id="out-height" type="number" min="32" max="8192" step="2" data-i18n-placeholder="output.height" placeholder="高"/>
+            </span>
+            <span class="ratio-row">
+              <button id="ratio-1" data-i18n-title="output.ratio1" title="按原始尺寸输出">X1</button>
+              <button id="ratio-2" data-i18n-title="output.ratio2" title="按原始尺寸的 2 倍输出">X2</button>
+              <button id="ratio-4" data-i18n-title="output.ratio4" title="按原始尺寸的 4 倍输出">X4</button>
+            </span>
+          </div>
+          <label>
+            <span class="param-title" data-i18n="upscale.engine">放大引擎</span>
+            <select id="upscale">
+              <option value="none" data-i18n="upscale.none">关闭（不放大）</option>
+              <option value="vsr" selected data-i18n="upscale.vsr">RTX VSR</option>
+            </select>
+          </label>
+          <small class="hint" data-i18n="upscale.hint">放大依赖 RTX VSR（NVIDIA 网络超分）：需 RTX 20 系及以上显卡与 550+ 驱动，程序目录需带 nvngx_vsr.dll 与 rtx_vsr_host.dll。关闭或不可用时，导出不会超过原始分辨率，X2 / X4 按钮也会禁用。</small>
+          <div class="control">
+            <b data-i18n="upscale.quality">VSR 质量</b>
+            <select id="vsr-quality">
+              <option value="1" data-i18n="upscale.quality1">1 低（最快）</option>
+              <option value="2" data-i18n="upscale.quality2">2 中</option>
+              <option value="3" data-i18n="upscale.quality3">3 高</option>
+              <option value="4" selected data-i18n="upscale.quality4">4 超高（最佳）</option>
+            </select>
+            <small data-i18n="upscale.qualityHint">档位越高细节越好、耗时越长</small>
+          </div>
+          <div class="control">
+            <b data-i18n="interp.label">插帧</b>
+            <select id="interp">
+              <option value="1" data-i18n="interp.off">关闭</option>
+              <option value="2" selected>2x</option>
+              <option value="3">3x</option>
+              <option value="4">4x</option>
+            </select>
+            <small data-i18n="interp.hint">用 RIFE v4.6 在帧间生成中间帧（导出时生效）</small>
+            <small id="interp-note"></small>
+          </div>
+          <small class="hint" data-i18n="upscale.compareHint">对比视图中的“原图”侧以最近邻放大展示原始像素，便于与放大 + DLSS 后的效果对比。</small>
+        </section>
+
+        <section class="settings tab-page" id="tab-post" hidden>
+          <h2 data-i18n="post.title">后处理</h2>
+          <div class="control">
+            <b data-i18n="post.brightness">亮度</b>
+            <input id="post-brightness-num" type="number" min="0" max="2" step="0.05" value="1"/>
+            <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
+            <input id="post-brightness" type="range" min="0" max="2" step="0.01" value="1"/>
+          </div>
+          <div class="control">
+            <b data-i18n="post.contrast">对比度</b>
+            <input id="post-contrast-num" type="number" min="0" max="2" step="0.05" value="1"/>
+            <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
+            <input id="post-contrast" type="range" min="0" max="2" step="0.01" value="1"/>
+          </div>
+          <div class="control">
+            <b data-i18n="post.saturation">饱和度</b>
+            <input id="post-saturation-num" type="number" min="0" max="2" step="0.05" value="1"/>
+            <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
+            <input id="post-saturation" type="range" min="0" max="2" step="0.01" value="1"/>
+          </div>
+          <div class="control">
+            <b data-i18n="post.perPass">多 Pass 逐轮应用</b>
+            <input id="post-per-pass" type="checkbox" checked/>
+            <small data-i18n="post.perPassHint">开启时每轮 DLSS Pass 后应用后处理；关闭时仅在最后一轮后应用</small>
+          </div>
+          <small class="hint" data-i18n="post.hint">以上后处理对预览和导出均生效。</small>
+        </section>
+
+        <section class="settings tab-page" id="tab-encoder" hidden>
+          <h2 data-i18n="encoder.title">编码器</h2>
+          <label>
+            <span class="param-title" data-i18n="encoder.label">编码器</span>
+            <select id="encoder">
+              <option value="h264_nvenc" data-i18n="encoder.h264Nvenc">H.264 · NVENC（GPU）</option>
+              <option value="h265_nvenc" selected data-i18n="encoder.h265Nvenc">H.265 · NVENC（GPU）</option>
+              <option value="h265_nvenc_lossless" data-i18n="encoder.h265Lossless">H.265 / HEVC · NVENC Lossless（无损）</option>
+              <option value="h264_x264" data-i18n="encoder.h264Cpu">H.264 · x264（CPU）</option>
+              <option value="h265_x265" data-i18n="encoder.h265Cpu">H.265 · x265（CPU）</option>
+            </select>
+          </label>
+          <small class="hint" data-i18n="encoder.hint">H.264 NVENC 最高支持 4096×4096，更大的输出请改用 H.265；NVENC 不可用时会自动改用对应的 CPU 编码器。Lossless 模式使用 HEVC NVENC 无损编码。</small>
+          <div class="control">
+            <b data-i18n="encoder.quality">质量</b>
+            <input id="encoder-quality" type="number" min="0" max="51" step="1" value="23"/>
+            <small id="encoder-quality-note" data-i18n="encoder.qualityHint">数值越低画质越高（CQ / CRF），常用 18–28</small>
+          </div>
+          <div class="control">
+            <b data-i18n="encoder.audio">保持音频</b>
+            <input id="keep-audio" type="checkbox" checked/>
+            <small data-i18n="encoder.audioHint">导出视频时附带原视频的音轨（转为 AAC）</small>
+          </div>
+        </section>
+      </aside>
+    </section>
+
+    <footer>
+      <button id="export-current" data-i18n="footer.exportCurrent">导出当前画面</button>
+      <button id="export-full" class="primary" data-i18n="footer.exportVideo">导出 DLSS 视频</button>
+      <button id="batch-open" data-i18n="footer.batch">批量处理</button>
+      <button id="copy" data-i18n="footer.copy">复制当前画面</button>
+      <div id="export-progress-wrap" class="export-progress" hidden>
+        <progress id="export-progress" max="1" value="0"></progress>
+        <span id="export-progress-label" data-i18n="progress.prepare">准备导出…</span>
+        <button id="export-pause" hidden data-i18n="progress.pause">暂停</button>
+        <button id="export-cancel" hidden data-i18n="progress.cancel">取消</button>
+      </div>
+      <span id="status">就绪</span>
+    </footer>
   </main>
+
   <div id="batch-modal" hidden>
     <div class="batch-panel">
-      <div class="batch-head"><b>批量处理</b><button id="batch-close" title="关闭">✕</button></div>
+      <div class="batch-head"><b data-i18n="batch.title">批量处理</b><button id="batch-close" data-i18n-title="batch.close" title="关闭">✕</button></div>
       <div id="batch-summary" class="batch-summary"></div>
-      <div class="batch-toolbar"><button id="batch-add" class="primary">＋ 选择视频</button><span class="batch-hint">支持 mp4 / avi / mov / mkv / webm / wmv / m4v / gif，可多选</span></div>
-      <div id="batch-list"><div class="batch-empty">尚未选择视频</div></div>
-      <div class="batch-foot"><button id="batch-dir">选择输出文件夹</button><span id="batch-dir-label">未选择</span><span class="batch-flex"></span><button id="batch-cancel" hidden>取消</button><button id="batch-start" class="primary">开始导出</button></div>
+      <div class="batch-toolbar">
+        <button id="batch-add" class="primary" data-i18n="batch.add">＋ 选择视频</button>
+        <span class="batch-hint" data-i18n="batch.hint">支持 mp4 / avi / mov / mkv / webm / wmv / m4v / gif，可多选</span>
+      </div>
+      <div id="batch-list"><div class="batch-empty" data-i18n="batch.empty">尚未选择视频</div></div>
+      <div class="batch-foot">
+        <button id="batch-dir" data-i18n="batch.outputDir">选择输出文件夹</button>
+        <span id="batch-dir-label">未选择</span>
+        <span class="batch-flex"></span>
+        <button id="batch-cancel" hidden data-i18n="batch.cancel">取消</button>
+        <button id="batch-start" class="primary" data-i18n="batch.start">开始导出</button>
+      </div>
     </div>
   </div>
-  <script src="app.js"></script><script src="fixes.js"></script>
-</body></html>
+
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
+  <script src="fixes.js"></script>
+</body>
+</html>

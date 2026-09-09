@@ -79,7 +79,7 @@ impl Default for RenderSettings {
             brightness: 1.0,
             contrast: 1.0,
             saturation: 1.0,
-            post_per_pass: true,
+            post_per_pass: false,
             upscale: "vsr".into(),
             vsr_quality: 4,
             interpolation: 2,
@@ -612,6 +612,16 @@ fn probe_f64(value: &serde_json::Value) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+// rawvideo 管道不携带时间戳。优先用同一视频流的总帧数/时长还原平均帧率，
+// 避免错误或不一致的 avg_frame_rate 元数据让成片加速或减速。
+fn normalized_video_fps(frames: Option<u32>, duration: Option<f64>, fallback: f64) -> f64 {
+    frames
+        .zip(duration)
+        .map(|(frames, seconds)| frames as f64 / seconds)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(fallback)
+}
+
 fn video_probe(path: &str) -> Result<(u32, u32, u32, f64), String> {
     let out = tool("ffprobe")?
         .args([
@@ -635,10 +645,12 @@ fn video_probe(path: &str) -> Result<(u32, u32, u32, f64), String> {
     let stream = value["streams"].get(0).cloned().ok_or("没有视频流")?;
     let width = stream["width"].as_u64().ok_or("无效视频宽度")? as u32;
     let height = stream["height"].as_u64().ok_or("无效视频高度")? as u32;
-    let fps = probe_fps(&stream);
+    let declared_fps = probe_fps(&stream);
     let duration =
         probe_f64(&stream["duration"]).or_else(|| probe_f64(&value["format"]["duration"]));
-    let frames = probe_u32(&stream["nb_frames"])
+    let reported_frames = probe_u32(&stream["nb_frames"]);
+    let fps = normalized_video_fps(reported_frames, duration, declared_fps);
+    let frames = reported_frames
         .or_else(|| duration.map(|seconds| (seconds * fps).round().max(1.0) as u32))
         .unwrap_or(1)
         .max(1);
@@ -658,7 +670,7 @@ fn preview_dimensions(width: u32, height: u32, max_side: u32) -> (u32, u32) {
     }
 }
 
-// 输出尺寸约束：32..=8192 且取偶（视频 yuv420p 编码要求），越界时按比例整体缩放
+// 输出尺寸约束：32..=8192 且取偶（视频编码要求），越界时按比例整体缩放
 fn sanitize_output(width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
     let (width, height) = (width?, height?);
     if width == 0 || height == 0 {
@@ -1657,23 +1669,30 @@ fn nvenc_available(encoder: &str) -> bool {
         .unwrap_or(false)
 }
 
-// 解析编码器设置：NVENC 不可用时回退对应的 CPU 编码器，返回 (ffmpeg 编码器名, 是否硬件)
-fn resolve_encoder(requested: &str) -> (&'static str, bool) {
+// 解析编码器设置：NVENC 不可用时回退对应的 CPU 编码器，返回 (ffmpeg 编码器名, 是否硬件, 是否无损)
+fn resolve_encoder(requested: &str) -> (&'static str, bool, bool) {
     match requested {
         "h265_nvenc" => {
             if nvenc_available("hevc_nvenc") {
-                ("hevc_nvenc", true)
+                ("hevc_nvenc", true, false)
             } else {
-                ("libx265", false)
+                ("libx265", false, false)
             }
         }
-        "h264_x264" => ("libx264", false),
-        "h265_x265" => ("libx265", false),
+        "h265_nvenc_lossless" => {
+            if nvenc_available("hevc_nvenc") {
+                ("hevc_nvenc", true, true)
+            } else {
+                ("libx265", false, true)
+            }
+        }
+        "h264_x264" => ("libx264", false, false),
+        "h265_x265" => ("libx265", false, false),
         _ => {
             if nvenc_available("h264_nvenc") {
-                ("h264_nvenc", true)
+                ("h264_nvenc", true, false)
             } else {
-                ("libx264", false)
+                ("libx264", false, false)
             }
         }
     }
@@ -1741,7 +1760,7 @@ fn export_one_video(
     let (decode_w, decode_h) = if bypass { (source_w, source_h) } else { (w, h) };
     let quality = settings.encoder_quality.clamp(0, 51);
     let quality_s = quality.to_string();
-    let (encoder, hw) = resolve_encoder(&settings.encoder);
+    let (encoder, hw, lossless) = resolve_encoder(&settings.encoder);
     // NVENC 分辨率上限：H.264 4096×4096，H.265 8192×8192
     if hw && encoder == "h264_nvenc" && (w > 4096 || h > 4096) {
         return Err(format!(
@@ -1753,11 +1772,17 @@ fn export_one_video(
             "H.265 (NVENC) 最高支持 8192×8192，当前输出 {w}×{h}。"
         ));
     }
-    let label = match encoder {
-        "h264_nvenc" => "H.264 NVENC".to_string(),
-        "hevc_nvenc" => "H.265 NVENC".to_string(),
-        "libx264" => "H.264 x264 (CPU)".to_string(),
-        _ => "H.265 x265 (CPU)".to_string(),
+    let label = if lossless && hw {
+        "H.265 / HEVC NVENC Lossless".to_string()
+    } else if lossless {
+        "H.265 / HEVC Lossless (CPU fallback)".to_string()
+    } else {
+        match encoder {
+            "h264_nvenc" => "H.264 NVENC".to_string(),
+            "hevc_nvenc" => "H.265 NVENC".to_string(),
+            "libx264" => "H.264 x264 (CPU)".to_string(),
+            _ => "H.265 x265 (CPU)".to_string(),
+        }
     };
     // 插帧：ratio=1 为关闭；输出帧率与总帧数按倍数换算
     let ratio = if settings.interpolation >= 2 {
@@ -1784,13 +1809,25 @@ fn export_one_video(
     let result: Result<u32, String> = (|| {
         let frame_bytes = (decode_w * decode_h * 4) as usize;
         let scale_filter = format!("scale={w}:{h}:flags=lanczos");
+        // 处理前显式归一化帧率。这样 rawvideo 的帧数与编码器的时间轴一致，
+        // 同时仍按输入视频的实际时长处理可变帧率素材。
+        let decode_filter = if !bypass && (w, h) != (source_w, source_h) {
+            format!("{scale_filter},fps=fps={fps}:round=near")
+        } else {
+            format!("fps=fps={fps}:round=near")
+        };
         let mut command = tool("ffmpeg")?;
         command.args(["-v", "error", "-i", &path]);
-        if !bypass && (w, h) != (source_w, source_h) {
-            command.args(["-vf", &scale_filter]);
-        }
         let mut decode = command
-            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .args([
+                "-vf",
+                &decode_filter,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1817,12 +1854,48 @@ fn export_one_video(
                 "0:v",
             ])
             .args(if settings.keep_audio {
-                vec!["-map", "1:a?", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+                // 保留音轨时补齐较短的音轨；-shortest 因而始终以处理后视频的结尾为准，
+                // 不会因为音轨较短而截断视频。
+                vec![
+                    "-map",
+                    "1:a?",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-af",
+                    "apad",
+                    "-shortest",
+                ]
             } else {
                 Vec::new()
             })
-            .args(["-pix_fmt", "yuv420p"])
-            .args(if hw {
+            .args(["-pix_fmt", if lossless { "gbrp" } else { "yuv420p" }])
+            .args(if lossless && hw {
+                vec![
+                    "-profile:v",
+                    "rext",
+                    "-c:v",
+                    encoder,
+                    "-tune",
+                    "lossless",
+                    "-rc",
+                    "constqp",
+                    "-qp",
+                    "0",
+                ]
+            } else if lossless {
+                vec![
+                    "-c:v",
+                    encoder,
+                    "-preset",
+                    "veryfast",
+                    "-x265-params",
+                    "lossless=1",
+                    "-crf",
+                    "0",
+                ]
+            } else if hw {
                 vec![
                     "-c:v",
                     encoder,
@@ -2266,6 +2339,19 @@ fn batch_cancel(state: tauri::State<'_, AppState>) {
 #[cfg(test)]
 mod render_order_tests {
     use super::*;
+
+    #[test]
+    fn uses_frame_count_and_duration_to_preserve_raw_video_timing() {
+        // A broken nominal FPS must not shrink 2,460 frames from 73 seconds to 41 seconds.
+        let fps = normalized_video_fps(Some(2_460), Some(73.0), 60.0);
+        assert!((fps - (2_460.0 / 73.0)).abs() < f64::EPSILON);
+        assert!(((2_460.0 / fps) - 73.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn uses_declared_fps_when_frame_timing_is_unavailable() {
+        assert_eq!(normalized_video_fps(None, Some(73.0), 29.97), 29.97);
+    }
 
     #[test]
     fn defers_vsr_only_for_a_real_multi_pass_upscale() {
