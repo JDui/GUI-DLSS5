@@ -61,14 +61,11 @@ function sourceSize() { const w=state.info?.width||originalPreview.naturalWidth|
 function markRatio() { const base=sourceSize(),w=+$('out-width').value,h=+$('out-height').value; [['ratio-1',1],['ratio-2',2],['ratio-4',4]].forEach(([id,k])=>{ const t=base?fitOutput(base[0]*k,base[1]*k):null; $(id).classList.toggle('active',!!t&&t[0]===w&&t[1]===h); }); }
 function syncOutputInputs() { const s=outputSize(); if(s){$('out-width').value=s[0];$('out-height').value=s[1];} markRatio(); }
 function updateSizeNote() { const s=sourceSize(), el=$('size-note'); if(el) el.textContent=s?t('output.sizeNote',{width:s[0],height:s[1]}):''; }
-let interpAuto = true;
-function updateInterpDefault() {
+function updateInterpNote() {
   const fps = state.info?.fps || 0;
   const note = $('interp-note');
   if (note) note.textContent = fps > 0 ? t('interp.fpsNote',{fps: fps >= 100 ? fps.toFixed(0) : fps.toFixed(2)}) : '';
-  if (interpAuto && fps > 0) $('interp').value = fps >= 60 ? '1' : '2';
 }
-$('interp').onchange = () => { interpAuto = false; };
 function setRatio(k) { if(!vsrEnabled())return; const base=sourceSize(); if(!base)return; const t=fitOutput(base[0]*k,base[1]*k); if(!t)return; $('out-width').value=t[0]; $('out-height').value=t[1]; markRatio(); refresh(true); }
 $('ratio-1').onclick=()=>setRatio(1); $('ratio-2').onclick=()=>setRatio(2); $('ratio-4').onclick=()=>setRatio(4);
 $('out-width').onchange=$('out-height').onchange=()=>{syncOutputInputs();refresh(true);};
@@ -185,7 +182,7 @@ async function loadPath(path) {
   refreshQueuedFit=false;
   const info=await invoke('media_info',{path}); revokeMedia(); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,sourceData:null,splitX:null,loadedFrame:-1});
   const initial=fitOutput(info.width,info.height)||[info.width,info.height];
-  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote(); updateInterpDefault();
+  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote(); updateInterpNote();
   if(info.kind==='video') {
     statusT('status.firstPreview');
     state.originalUrl=await invokePng('frame_png',{path:info.path,frame:0,maxSide:PREVIEW_MAX_SIDE,...outputArgs(),...upscaleArgs()});

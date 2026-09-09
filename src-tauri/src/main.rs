@@ -82,7 +82,7 @@ impl Default for RenderSettings {
             post_per_pass: false,
             upscale: "vsr".into(),
             vsr_quality: 4,
-            interpolation: 2,
+            interpolation: 1,
             encoder: "h265_nvenc".into(),
             encoder_quality: 23,
             keep_audio: true,
