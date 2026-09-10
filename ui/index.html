@@ -87,8 +87,7 @@
       <aside>
         <nav class="tabs">
           <button class="tab active" data-tab="dlss" data-i18n="tabs.dlss" data-i18n-title="dlss.title" title="DLSS 参数">DLSS 参数</button>
-          <button class="tab" data-tab="upscale" data-i18n="tabs.upscale" data-i18n-title="upscale.title" title="放大">放大</button>
-          <button class="tab" data-tab="post" data-i18n="tabs.post" data-i18n-title="post.title" title="后处理">后处理</button>
+          <button class="tab" data-tab="upscale" data-i18n="tabs.upscale" data-i18n-title="upscale.title" title="增益">增益</button>
           <button class="tab" data-tab="encoder" data-i18n="tabs.encoder" data-i18n-title="encoder.title" title="编码器">编码器</button>
         </nav>
 
@@ -152,7 +151,7 @@
         </section>
 
         <section class="settings tab-page" id="tab-upscale" hidden>
-          <h2 data-i18n="upscale.title">放大</h2>
+          <h2 data-i18n="upscale.title">增益</h2>
           <div class="out-size">
             <b><span data-i18n="output.size">输出尺寸</span><small id="size-note"></small></b>
             <span class="size-fields" data-i18n-title="output.customTitle" title="自定义输出分辨率；预览任一单边最高 4520，导出按此尺寸处理">
@@ -195,10 +194,6 @@
             <small data-i18n="interp.hint">用 RIFE v4.6 在帧间生成中间帧（导出时生效）</small>
             <small id="interp-note"></small>
           </div>
-        </section>
-
-        <section class="settings tab-page" id="tab-post" hidden>
-          <h2 data-i18n="post.title">后处理</h2>
           <div class="control">
             <b data-i18n="post.brightness">亮度</b>
             <input id="post-brightness-num" type="number" min="0" max="2" step="0.05" value="1"/>
@@ -217,8 +212,7 @@
             <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
             <input id="post-saturation" type="range" min="0" max="2" step="0.01" value="1"/>
           </div>
-          <!-- 逐轮应用仅在「RTX VSR 放大 + 多重 Pass」路径生效，渲染器暂不支持所有路径逐轮插入后处理，先隐藏（保持仅末轮应用） -->
-          <div class="control" hidden>
+          <div class="control">
             <b data-i18n="post.perPass">多 Pass 逐轮应用</b>
             <input id="post-per-pass" type="checkbox"/>
             <small data-i18n="post.perPassHint">开启时每轮 DLSS Pass 后应用后处理；关闭时仅在最后一轮后应用</small>
