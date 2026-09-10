@@ -9,3 +9,6 @@
 *.lib
 /tools/
 /vsr_host/vsr_host_test.exe
+
+/rife_host/build/
+/rife_host/test_loader.exe

@@ -56,6 +56,7 @@ struct RenderSettings {
     post_per_pass: bool,
     upscale: String,
     vsr_quality: i32,
+    interpolation: i32,
     encoder: String,
     encoder_quality: i32,
     keep_audio: bool,
@@ -81,6 +82,7 @@ impl Default for RenderSettings {
             post_per_pass: false,
             upscale: "vsr".into(),
             vsr_quality: 4,
+            interpolation: 1,
             encoder: "h265_nvenc".into(),
             encoder_quality: 23,
             keep_audio: true,
@@ -367,12 +369,56 @@ impl Drop for VsrHost {
     }
 }
 
+// RIFE 补帧（nihui/rife-ncnn-vulkan，MIT；ncnn Vulkan 推理），用于视频导出插帧。
+// 注意：不实现 Drop 调用 rife_shutdown——ncnn 静态析构在进程退出时会段错误，随进程回收即可。
+type RfInitFn = unsafe extern "C" fn(*const u16, i32, i32) -> i32;
+type RfInterpFn = unsafe extern "C" fn(*const u8, *const u8, i32, i32, f32, *mut u8) -> i32;
+
+struct RifeHost {
+    _library: Library,
+    interp: RfInterpFn,
+}
+
+impl RifeHost {
+    unsafe fn open(root: &Path) -> Result<Self, String> {
+        let library = Library::new(root.join("rife_host.dll"))
+            .map_err(|e| format!("无法加载 rife_host.dll: {e}"))?;
+        let init = *library
+            .get::<RfInitFn>(b"rife_init\0")
+            .map_err(|e| e.to_string())?;
+        let interp = *library
+            .get::<RfInterpFn>(b"rife_interp\0")
+            .map_err(|e| e.to_string())?;
+        let dir = wide(&root.join("models").join("rife-v4.6"));
+        if init(dir.as_ptr(), 0, 1) == 0 {
+            return Err(
+                "RIFE 插帧不可用：缺少 models/rife-v4.6 模型，或显卡不支持 Vulkan。".into(),
+            );
+        }
+        Ok(Self {
+            _library: library,
+            interp,
+        })
+    }
+
+    unsafe fn interp(&self, a: &[u8], b: &[u8], w: u32, h: u32, t: f32) -> Option<Vec<u8>> {
+        let mut out = vec![0_u8; a.len()];
+        if (self.interp)(a.as_ptr(), b.as_ptr(), w as i32, h as i32, t, out.as_mut_ptr()) == 1 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
 struct AppState {
     root: PathBuf,
     temp_dir: PathBuf,
     host: Mutex<Option<Host>>,
     vsr: Mutex<Option<VsrHost>>,
     vsr_disabled: AtomicBool,
+    rife: Mutex<Option<RifeHost>>,
+    rife_disabled: AtomicBool,
     media: Mutex<HashMap<String, MediaInfo>>,
     decoder: Mutex<Option<VideoDecoder>>,
     temp_counter: AtomicU64,
@@ -733,6 +779,27 @@ fn upscale_frame(
         }
     }
     image::imageops::resize(&image, tw, th, FilterType::Nearest)
+}
+
+// RIFE 推理；宿主加载或推理失败时返回 None，调用方按各自策略兜底
+fn rife_with<T>(state: &AppState, f: impl FnOnce(&RifeHost) -> Option<T>) -> Option<T> {
+    if state.rife_disabled.load(Ordering::Acquire) {
+        return None;
+    }
+    if let Ok(mut slot) = state.rife.lock() {
+        if slot.is_none() {
+            match unsafe { RifeHost::open(&state.root) } {
+                Ok(host) => *slot = Some(host),
+                Err(error) => {
+                    state.rife_disabled.store(true, Ordering::Release);
+                    eprintln!("[DLSS5] {error}");
+                    return None;
+                }
+            }
+        }
+        return slot.as_ref().and_then(|host| f(host));
+    }
+    None
 }
 
 // 正式导出使用严格 VSR：任何初始化/推理失败都返回错误，不允许静默退化为普通插值。
@@ -1717,7 +1784,28 @@ fn export_one_video(
             _ => "H.265 x265 (CPU)".to_string(),
         }
     };
-    on_progress(0, total_frames, format!("使用 {label}，正在导出 {w}×{h}…"));
+    // 插帧：ratio=1 为关闭；输出帧率与总帧数按倍数换算
+    let ratio = if settings.interpolation >= 2 {
+        settings.interpolation.min(4)
+    } else {
+        1
+    };
+    let out_fps = fps * ratio as f64;
+    let out_total = (((total_frames as u64).saturating_sub(1)) * ratio as u64 + 1)
+        .min(u32::MAX as u64) as u32;
+    on_progress(
+        0,
+        out_total,
+        format!(
+            "使用 {label}，正在导出 {w}×{h} @ {:.0}fps{}…",
+            out_fps,
+            if ratio > 1 {
+                format!("（RIFE {}x）", ratio)
+            } else {
+                String::new()
+            }
+        ),
+    );
     let result: Result<u32, String> = (|| {
         let frame_bytes = (decode_w * decode_h * 4) as usize;
         let scale_filter = format!("scale={w}:{h}:flags=lanczos");
@@ -1757,7 +1845,7 @@ fn export_one_video(
                 "-s",
                 &format!("{w}x{h}"),
                 "-r",
-                &fps.to_string(),
+                &out_fps.to_string(),
                 "-i",
                 "-",
                 "-i",
@@ -1884,6 +1972,9 @@ fn export_one_video(
             }
         });
         let mut count = 0;
+        let mut written = 0_u32;
+        let mut prev: Vec<u8> = Vec::new();
+        let mut have_prev = false;
         let mut cancelled = false;
         let mut outcome: Result<u32, String> = Ok(0);
         for message in rx {
@@ -1941,15 +2032,54 @@ fn export_one_video(
                     break;
                 }
             };
-            if let Err(e) = writer.write_all(&rendered.into_raw()) {
-                outcome = Err(format!("视频编码写入失败: {e}"));
-                break;
+            let rgba = rendered.into_raw();
+            if ratio == 1 {
+                if let Err(e) = writer.write_all(&rgba) {
+                    outcome = Err(format!("视频编码写入失败: {e}"));
+                    break;
+                }
+            } else if !have_prev {
+                // 首帧直接写入
+                if let Err(e) = writer.write_all(&rgba) {
+                    outcome = Err(format!("视频编码写入失败: {e}"));
+                    break;
+                }
+                prev = rgba;
+                have_prev = true;
+            } else {
+                // 插帧：在上一增强帧与当前增强帧之间生成中间帧
+                let mut write_failed = false;
+                for k in 1..ratio {
+                    let t = k as f32 / ratio as f32;
+                    let slot = match rife_with(state, |host| unsafe {
+                        host.interp(&prev, &rgba, w, h, t)
+                    }) {
+                        Some(interpolated) => interpolated,
+                        // RIFE 失败时复制当前帧兜底，保证帧数与时长一致
+                        None => rgba.clone(),
+                    };
+                    if let Err(e) = writer.write_all(&slot) {
+                        outcome = Err(format!("视频编码写入失败: {e}"));
+                        write_failed = true;
+                        break;
+                    }
+                    written += 1;
+                }
+                if write_failed {
+                    break;
+                }
+                if let Err(e) = writer.write_all(&rgba) {
+                    outcome = Err(format!("视频编码写入失败: {e}"));
+                    break;
+                }
+                prev = rgba;
             }
+            written += 1;
             count += 1;
             on_progress(
-                count,
-                total_frames,
-                format!("正在导出第 {count} / {total_frames} 帧"),
+                written,
+                out_total,
+                format!("正在导出第 {written} / {out_total} 帧"),
             );
         }
         let _ = reader_thread.join();
@@ -2318,6 +2448,8 @@ fn main() {
                 host: Mutex::new(None),
                 vsr: Mutex::new(None),
                 vsr_disabled: AtomicBool::new(false),
+                rife: Mutex::new(None),
+                rife_disabled: AtomicBool::new(false),
                 media: Mutex::new(HashMap::new()),
                 decoder: Mutex::new(None),
                 temp_counter: AtomicU64::new(0),

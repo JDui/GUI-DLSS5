@@ -103,6 +103,7 @@ aside{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
 .settings>label{display:grid;gap:5px;font-weight:600}
 .settings select{width:100%}
 .control{display:grid;grid-template-columns:1fr 68px;gap:4px;margin-top:14px}
+.control[hidden]{display:none}
 .control b{font-weight:600;color:var(--label)}
 .control small,.control input[type=range]{grid-column:1/3;color:var(--muted)}
 .control input[type=number]{width:68px;background:var(--field);color:var(--text);border:1px solid var(--edge);border-radius:4px;text-align:center;font:12px Consolas,monospace;font-variant-numeric:tabular-nums}
