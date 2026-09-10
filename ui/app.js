@@ -29,6 +29,16 @@ function revokeMedia() { deferRevoke(state.originalUrl); deferRevoke(state.proce
 function syncControls(range, number, max=1) { $(range).oninput = () => { $(number).value = $(range).value; refresh(); }; $(number).onchange = () => { $(range).value = Math.max(0, Math.min(max, +$(number).value || 0)); refresh(); }; }
 syncControls('intensity','intensity-num'); syncControls('tone','tone-num'); syncControls('struct','struct-num'); syncControls('skin','skin-num');
 syncControls('post-brightness','post-brightness-num',2); syncControls('post-contrast','post-contrast-num',2); syncControls('post-saturation','post-saturation-num',2);
+// NR 处理强度为 0 时不启用神经渲染：置灰 NR 页全部其他选项
+function syncNrControls() {
+  const off = +$('intensity').value <= 0;
+  ['multi-pass','style','tone','tone-num','struct','struct-num','skin','skin-num','auto-mask','ui-correction','pass-count','pass-count-num'].forEach(id=>$(id).disabled=off);
+  $('pass-control').hidden = off || !$('multi-pass').checked;
+}
+const intensityInput=$('intensity').oninput, intensityChange=$('intensity').onchange;
+$('intensity').oninput=()=>{intensityInput();syncNrControls();};
+$('intensity').onchange=()=>{intensityChange();syncNrControls();};
+syncNrControls();
 $('post-per-pass').onchange=()=>refresh();
 $('auto-mask').onchange=()=>refresh(); $('ui-correction').onchange=()=>refresh();
 $('multi-pass').onchange=()=>{ $('pass-control').hidden=!$('multi-pass').checked; refresh(); };
@@ -60,9 +70,21 @@ function outputArgs() { const s=outputSize(); return {outputWidth:s?s[0]:null,ou
 function sourceSize() { const w=state.info?.width||originalPreview.naturalWidth||preview.naturalWidth, h=state.info?.height||originalPreview.naturalHeight||preview.naturalHeight; return w&&h?[w,h]:null; }
 function markRatio() { const base=sourceSize(),w=+$('out-width').value,h=+$('out-height').value; [['ratio-1',1],['ratio-2',2],['ratio-4',4]].forEach(([id,k])=>{ const t=base?fitOutput(base[0]*k,base[1]*k):null; $(id).classList.toggle('active',!!t&&t[0]===w&&t[1]===h); }); }
 function syncOutputInputs() { const s=outputSize(); if(s){$('out-width').value=s[0];$('out-height').value=s[1];} markRatio(); }
-function updateSizeNote() { const s=sourceSize(), el=$('size-note'); if(el) el.textContent=s?t('output.sizeNote',{width:s[0],height:s[1]}):''; }
+const interpFactor = () => +$('interp').value || 1;
+function updateSizeNote() {
+  const el=$('size-note');
+  if(!el)return;
+  // 显示最终输出帧率：源帧率 × 插帧倍数
+  const fps=state.kind==='video'?(state.info?.fps||0)*interpFactor():0;
+  el.textContent=state.path&&sourceSize()?(fps>0?t('output.fps',{fps:fps>=100?fps.toFixed(0):fps.toFixed(2)}):t('output.static')):'';
+}
+function updateInterpAvailability() { $('interp').disabled = state.kind === 'image' || state.kind === 'clipboard'; }
+// 时间轴与播放控制条仅在载入动态素材时显示：视频与 GIF（GIF 在后端烘焙为 mp4，kind 同为 video）
+function updateTimelineVisibility() { const animated=state.kind==='video'&&!!state.path; $('timeline').hidden=!animated; $('transport-center').hidden=!animated; }
+updateInterpAvailability();
+updateTimelineVisibility();
 function updateInterpNote() {
-  const fps = state.info?.fps || 0;
+  const fps = state.kind==='video' ? (state.info?.fps || 0) : 0;
   const note = $('interp-note');
   if (note) note.textContent = fps > 0 ? t('interp.fpsNote',{fps: fps >= 100 ? fps.toFixed(0) : fps.toFixed(2)}) : '';
 }
@@ -78,6 +100,19 @@ function updateUpscaleAvailability(){
 }
 $('upscale').onchange=()=>{updateUpscaleAvailability();syncOutputInputs();updateSizeNote();refresh(true);};
 $('vsr-quality').onchange=()=>refresh();
+// 插帧变更：时间轴按插帧后总帧数重算，输出帧率与预览同步更新
+function syncTimeline() {
+  const total=Math.max(0,(state.info?.frames||1)-1)*interpFactor();
+  $('frame').max=total;
+  if(+$('frame').value>total)$('frame').value=total;
+  $('frame-label').textContent=t('frame.label',{current:$('frame').value,total});
+}
+let interpPrevFactor=1;
+$('interp').onchange=()=>{stopPlayback(); // 切换倍率时按时间位置换算当前帧，保证插帧改变后仍停留在原播放位置
+  const oldF=interpPrevFactor,newF=interpFactor();
+  if(newF!==oldF&&+$('frame').max>0)$('frame').value=Math.round(+$('frame').value*newF/oldF);
+  interpPrevFactor=newF;
+  syncTimeline();updateSizeNote();updateInterpNote();refresh();};
 function syncEncoderControls() {
   const lossless = $('encoder').value === 'h265_nvenc_lossless';
   const quality = $('encoder-quality');
@@ -182,7 +217,7 @@ async function loadPath(path) {
   refreshQueuedFit=false;
   const info=await invoke('media_info',{path}); revokeMedia(); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,sourceData:null,splitX:null,loadedFrame:-1});
   const initial=fitOutput(info.width,info.height)||[info.width,info.height];
-  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote(); updateInterpNote();
+  $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote(); updateInterpNote(); updateInterpAvailability(); updateTimelineVisibility();
   if(info.kind==='video') {
     statusT('status.firstPreview');
     state.originalUrl=await invokePng('frame_png',{path:info.path,frame:0,maxSide:PREVIEW_MAX_SIDE,...outputArgs(),...upscaleArgs()});
@@ -190,7 +225,8 @@ async function loadPath(path) {
   } else {
     state.originalUrl=await invokePng('read_image_data',{path:info.path,maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
   }
-  $('source').textContent=t('source.loaded',{name:path.split(/[\\/]/).pop(),type:info.kind==='video'?t('media.video'):t('media.image'),width:info.width,height:info.height}); $('frame').max=Math.max(0,info.frames-1); $('frame').value=0; $('frame-label').textContent=t('frame.label',{current:0,total:Math.max(0,info.frames-1)}); $('export-full').textContent=t(info.kind==='video'?'footer.exportVideo':'footer.exportImage');
+  $('source').textContent=t('source.loaded',{name:path.split(/[\\/]/).pop(),type:info.kind==='video'?t('media.video'):t('media.image'),width:info.width,height:info.height});
+  $('frame').max=Math.max(0,info.frames-1)*interpFactor(); $('frame').value=0; $('frame-label').textContent=t('frame.label',{current:0,total:$('frame').max}); $('export-full').textContent=t(info.kind==='video'?'footer.exportVideo':'footer.exportImage');
   chooseDisplayed(true);
   statusT('status.preview'); await refresh(true,0);
 }
@@ -216,7 +252,7 @@ setInterval(pollNativeDrop,120);
 pollNativeDrop();
 let exportBusy=false, exportPaused=false, exportPollFailureLogged=false;
 const exportButtons=[$('export-current'),$('export-full')];
-let latestExportProgress=null;
+let latestExportProgress=null, exportStatusBase=null, exportStartedAt=0;
 function localizeExportProgressMessage(message) {
   const text=String(message||'');
   const fixed={
@@ -252,10 +288,22 @@ function showExportProgress(current,total,messageKey,messageVariables) {
 async function pollExportProgress() {
   try {
     renderExportProgress(await invoke('poll_export_progress'));
+    // 导出中更新右下角状态：导出规格 + 剩余时间估算（进度可算时才显示）
+    if(exportStatusBase){
+      const bar=$('export-progress'), total=+bar.max||0, cur=+bar.value||0;
+      let text=exportStatusBase;
+      if(total>0&&cur>0&&cur<total){
+        const eta=(Date.now()-exportStartedAt)/1000/cur*(total-cur);
+        text+=' '+t('status.exportEta',{time:fmtEta(eta)});
+      }
+      $('status').textContent=text;
+    }
   } catch(e) {
     if(!exportPollFailureLogged){log(`导出进度: ${e}`);exportPollFailureLogged=true;}
   }
 }
+// 剩余时间格式化为 m:ss 或 h:mm:ss
+const fmtEta=s=>{s=Math.max(1,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}:${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`:`${m}:${String(s%60).padStart(2,'0')}`;};
 setInterval(pollExportProgress,120);
 pollExportProgress();
 function setExportBusy(busy) { exportBusy=busy; exportButtons.forEach(button=>button.disabled=busy); $('export-pause').hidden=!busy; $('export-cancel').hidden=!busy; if(!busy){exportPaused=false;$('export-pause').textContent=t('progress.pause');} }
@@ -269,7 +317,7 @@ async function runExport(total, task) {
   } catch(e) {
     showExportProgress(0,total,'status.exportFailed');
     throw e;
-  } finally { setExportBusy(false); }
+  } finally { setExportBusy(false); exportStatusBase=null; }
 }
 const exportPauseButton = $('export-pause');
 exportPauseButton.onclick=async()=>{ if(!exportBusy)return; const paused=!exportPaused; try { await invoke('export_set_paused',{paused}); exportPaused=paused; exportPauseButton.textContent=paused?t('progress.resume'):t('progress.pause'); statusT(paused?'status.exportPaused':'status.exportResume'); } catch(e) { log(`导出暂停/继续: ${e}`); } };
@@ -289,15 +337,23 @@ function refresh(fit=false, delay=90) {
     state.busy=true;
     const renderPath=state.path;
     const renderKind=state.kind;
-    const renderFrame=+$('frame').value;
+    let renderFrame=+$('frame').value;
     const renderFit=refreshQueuedFit;
     refreshQueuedFit=false;
     try {
-      statusT('status.refreshPreview');
+      // 播放中不刷新右下角状态，避免反复闪烁
+      if(playHandle===null)statusT('status.refreshPreview');
       let processedUrl, originalUrl;
       if(renderKind==='video') {
-        processedUrl=await invokePng('render_frame_png',{path:renderPath,frame:renderFrame,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
-        if(renderFrame!==state.loadedFrame) originalUrl=await invokePng('frame_png',{path:renderPath,frame:renderFrame,maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
+        // 插帧预览：位置按插帧后总帧数计，子帧位置用 RIFE 在相邻两帧的 NR 渲染结果间生成
+        const factor=interpFactor();
+        const p=renderFrame;
+        const base=Math.floor(p/factor), k=p%factor;
+        processedUrl=k===0
+          ? await invokePng('render_frame_png',{path:renderPath,frame:base,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()})
+          : await invokePng('render_frame_interp_png',{path:renderPath,frame:base,t:k/factor,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
+        if(base!==state.loadedFrame) originalUrl=await invokePng('frame_png',{path:renderPath,frame:base,maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
+        if(originalUrl) renderFrame=base;
       } else if(renderKind==='clipboard') {
         processedUrl=await invokePng('process_image_data',{data:state.sourceData,runtime:$('runtime').value,settings:settings(),maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
       } else {
@@ -308,7 +364,7 @@ function refresh(fit=false, delay=90) {
         deferRevoke(state.processedUrl);
         state.processedUrl=processedUrl;
         chooseDisplayed(renderFit);
-        statusT('status.ready');
+        if(playHandle===null)statusT('status.ready');
       } else {
         URL.revokeObjectURL(processedUrl);
         if(originalUrl)URL.revokeObjectURL(originalUrl);
@@ -327,7 +383,7 @@ function refresh(fit=false, delay=90) {
   },delay));
 }
 $('open').onclick=async()=>{try{const path=await invoke('choose_media');if(path)await loadPath(path);}catch(e){log(String(e));statusT('status.importFailed');}};
-$('paste').onclick=async()=>{try{const item=(await navigator.clipboard.read()).find(i=>i.types.some(t=>t.startsWith('image/')));if(!item)throw Error(t('status.clipboardNoImage'));const type=item.types.find(t=>t.startsWith('image/'));const blob=await item.getType(type),reader=new FileReader();reader.onload=async()=>{const scaled=await scaleClipboard(reader.result);const pasted=await loadDataImage(scaled);revokeMedia();Object.assign(state,{path:'clipboard-image',kind:'clipboard',info:{kind:'image',frames:1,width:pasted.naturalWidth,height:pasted.naturalHeight},sourceData:scaled,originalUrl:URL.createObjectURL(await (await fetch(scaled)).blob()),splitX:null,loadedFrame:-1});$('out-width').value=pasted.naturalWidth;$('out-height').value=pasted.naturalHeight;markRatio();updateSizeNote();$('source').textContent=t('source.pasted');await refresh(true);};reader.readAsDataURL(blob);}catch(e){log(`粘贴: ${e}`);statusT('status.pasteFailed');}};
+$('paste').onclick=async()=>{try{const item=(await navigator.clipboard.read()).find(i=>i.types.some(t=>t.startsWith('image/')));if(!item)throw Error(t('status.clipboardNoImage'));const type=item.types.find(t=>t.startsWith('image/'));const blob=await item.getType(type),reader=new FileReader();reader.onload=async()=>{const scaled=await scaleClipboard(reader.result);const pasted=await loadDataImage(scaled);revokeMedia();Object.assign(state,{path:'clipboard-image',kind:'clipboard',info:{kind:'image',frames:1,width:pasted.naturalWidth,height:pasted.naturalHeight},sourceData:scaled,originalUrl:URL.createObjectURL(await (await fetch(scaled)).blob()),splitX:null,loadedFrame:-1});$('out-width').value=pasted.naturalWidth;$('out-height').value=pasted.naturalHeight;markRatio();updateSizeNote();updateInterpAvailability();updateTimelineVisibility();$('source').textContent=t('source.pasted');await refresh(true);};reader.readAsDataURL(blob);}catch(e){log(`粘贴: ${e}`);statusT('status.pasteFailed');}};
 const VIEW_HINT_KEYS={ quick:'hint.quick', compare:'hint.compare', ab:'hint.ab' };
 function syncViewHint(){ $('hint').textContent=t(VIEW_HINT_KEYS[$('view').value]||'hint.quick'); }
 const viewSwitch=$('view-switch'), viewThumb=$('view-thumb');
@@ -355,15 +411,23 @@ syncViewHint();
  function stopPlayback(){if(playHandle!==null){cancelAnimationFrame(playHandle);playHandle=null;}$('play').textContent=t('play.play');}
 function playbackTick(now){
   if(playHandle===null)return;
-  const total=+$('frame').max+1, fps=state.info?.fps||30;
+  // 按插帧后的输出帧率推进
+  const total=+$('frame').max+1, fps=(state.info?.fps||30)*interpFactor();
   const target=(playStartedFrame+Math.floor((now-playStartedAt)*fps/1000))%Math.max(1,total);
   if(!state.busy&&target!==+$('frame').value){$('frame').value=target;$('frame-label').textContent=t('frame.label',{current:target,total:$('frame').max});refresh(false,0);}
   playHandle=requestAnimationFrame(playbackTick);
 }
 $('frame').oninput=async event=>{if(event.isTrusted)stopPlayback();$('frame-label').textContent=t('frame.label',{current:$('frame').value,total:$('frame').max});await refresh(false,40);};
+// 跳帧按钮：最前 / 上一帧 / 下一帧 / 最后（按插帧后的帧位置计）
+function seekFrame(p){ if(state.kind!=='video')return; const max=+$('frame').max; const v=Math.max(0,Math.min(max,p)); stopPlayback(); $('frame').value=v; $('frame-label').textContent=t('frame.label',{current:v,total:max}); refresh(false,40); }
+$('frame-first').onclick=()=>seekFrame(0);
+$('frame-prev').onclick=()=>seekFrame(+$('frame').value-1);
+$('frame-next').onclick=()=>seekFrame(+$('frame').value+1);
+$('frame-last').onclick=()=>seekFrame(+$('frame').max);
  $('play').onclick=()=>{if(!state.info||state.kind!=='video')return;if(playHandle!==null){stopPlayback();return;}playStartedAt=performance.now();playStartedFrame=+$('frame').value;$('play').textContent=t('play.pause');playHandle=requestAnimationFrame(playbackTick);};
-$('export-current').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:false});if(!destination)return;await runExport(1,async()=>invoke('save_data_png',{data:await currentImageData(),destination}));log(`已导出当前画面: ${destination}`);statusT('status.currentExported');}catch(e){log(`当前画面导出失败: ${e}`);statusT('status.exportFailed');}};
-$('export-full').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:state.kind==='video'});if(!destination)return;const total=state.kind==='video'?Math.max(1,state.info?.frames||1):1;await runExport(total,async()=>{const size=outputSize();status(size?()=>t('status.exportSize',{width:size[0],height:size[1]}):()=>t('status.exportOriginalSize'));if(state.kind==='video'){const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings(),...outputArgs()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:await urlToDataUri(state.processedUrl||state.originalUrl),destination,...outputArgs(),...upscaleArgs()});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings(),...outputArgs()});log(`已导出: ${destination}`);}});statusT('status.exportDone');}catch(e){log(`导出失败: ${e}`);const text=String(e);statusT(text.includes('取消')||text.toLowerCase().includes('cancel')?'status.exportCancelled':'status.exportFailed');}};
+$('export-current').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:false,source:state.path});if(!destination)return;await runExport(1,async()=>invoke('save_data_png',{data:await currentImageData(),destination}));log(`已导出当前画面: ${destination}`);statusT('status.currentExported');}catch(e){log(`当前画面导出失败: ${e}`);statusT('status.exportFailed');}};
+$('export-full').onclick=async()=>{if(!state.path||exportBusy)return;try{const destination=await invoke('choose_export',{video:state.kind==='video',source:state.path});if(!destination)return;const total=state.kind==='video'?Math.max(1,state.info?.frames||1):1;await runExport(total,async()=>{const size=outputSize();status(size?()=>t('status.exportSize',{width:size[0],height:size[1]}):()=>t('status.exportOriginalSize'));if(state.kind==='video'){ // 右下角显示导出规格（分辨率 + 输出帧率），剩余时间由进度轮询补充
+const size2=outputSize()||[state.info?.width||0,state.info?.height||0];const fps=(state.info?.fps||0)*interpFactor();exportStatusBase=t('status.exportingSpec',{width:size2[0],height:size2[1],fps:fps>=100?Math.round(fps):+fps.toFixed(2)});exportStartedAt=Date.now();status(()=>exportStatusBase);const frames=await invoke('export_video',{path:state.path,destination,runtime:$('runtime').value,settings:settings(),...outputArgs()});log(`已导出 ${frames} 帧: ${destination}`);}else if(state.kind==='clipboard'){await invoke('save_data_png',{data:await urlToDataUri(state.processedUrl||state.originalUrl),destination,...outputArgs(),...upscaleArgs()});log(`已导出: ${destination}`);}else{await invoke('save_png',{path:state.path,destination,runtime:$('runtime').value,settings:settings(),...outputArgs()});log(`已导出: ${destination}`);}});statusT('status.exportDone');}catch(e){log(`导出失败: ${e}`);const text=String(e);statusT(text.includes('取消')||text.toLowerCase().includes('cancel')?'status.exportCancelled':'status.exportFailed');}};
 $('copy').onclick=async()=>{if(!state.path)return;try{await navigator.clipboard.write([new ClipboardItem({'image/png':await(await fetch(await currentImageData())).blob()})]);statusT('status.copied');}catch(e){log(`复制失败: ${e}`);statusT('status.copyFailed');}};
 document.addEventListener('paste',()=>$('paste').click());
 new ResizeObserver(()=>{if(state.path&&Math.abs(state.zoom-state.fit)<.01)resetFit();updateSplit();}).observe(stage);
@@ -380,6 +444,28 @@ let batchRows = [];
 let batchDir = '';
 let batchRunning = false;
 let batchPollTimer = null;
+let batchImageCancel = false;
+let batchMode = 'video';
+const VIDEO_EXTS = ['mp4','avi','mov','mkv','webm','wmv','m4v','gif'];
+const IMAGE_EXTS = ['png','jpg','jpeg','webp','bmp'];
+const extOf = p => { const m = String(p).toLowerCase().match(/\.([a-z0-9]+)$/); return m ? m[1] : ''; };
+
+const batchModeSwitch = $('batch-mode'), batchModeThumb = $('batch-mode-thumb');
+function syncBatchModeSwitch() {
+  batchModeSwitch.querySelectorAll('.view-opt').forEach(b => b.classList.toggle('active', b.dataset.batch === batchMode));
+  const active = batchModeSwitch.querySelector('.view-opt.active');
+  if (active) { batchModeThumb.style.left = `${active.offsetLeft}px`; batchModeThumb.style.width = `${active.offsetWidth}px`; }
+}
+function syncBatchModeText() {
+  $('batch-add').textContent = t(batchMode === 'video' ? 'batch.add' : 'batch.addImage');
+  $('batch-hint').textContent = t(batchMode === 'video' ? 'batch.hint' : 'batch.hintImage');
+}
+batchModeSwitch.querySelectorAll('.view-opt').forEach(b => b.onclick = () => {
+  if (batchMode === b.dataset.batch) return;
+  batchMode = b.dataset.batch;
+  syncBatchModeSwitch();
+  syncBatchModeText();
+});
 
 function renderBatchRows() {
   const list = $('batch-list');
@@ -472,16 +558,16 @@ function batchSummary() {
     t('batch.dlss',{style:styleText,intensity:$('intensity').value,pass,post:postText}),
   ].join('\n');
 }
-$('batch-open').onclick = () => { $('batch-modal').hidden = false; $('batch-summary').textContent = batchSummary(); renderBatchRows(); if (batchRunning) startBatchPoll(); };
+$('batch-open').onclick = () => { $('batch-modal').hidden = false; $('batch-summary').textContent = batchSummary(); renderBatchRows(); syncBatchModeSwitch(); syncBatchModeText(); if (batchRunning) startBatchPoll(); };
 $('batch-close').onclick = () => {
   if (batchRunning && !confirm(t('batch.confirmClose'))) return;
-  if (batchRunning) invoke('batch_cancel');
+  if (batchRunning) { invoke('batch_cancel'); batchImageCancel = true; }
   $('batch-modal').hidden = true;
   stopBatchPoll();
 };
 $('batch-add').onclick = async () => {
   try {
-    const paths = await invoke('choose_media_multi');
+    const paths = await invoke(batchMode === 'video' ? 'choose_media_multi' : 'choose_images_multi');
     if (!paths) return;
     for (const p of paths) {
       if (!batchRows.some(r => r.path === p)) batchRows.push({ path: p, name: p.substring(Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/')) + 1) });
@@ -495,30 +581,85 @@ $('batch-dir').onclick = async () => {
     if (dir) { batchDir = dir; $('batch-dir-label').textContent = dir; $('batch-dir-label').title = dir; }
   } catch (e) { log(`批量: ${e}`); }
 };
+async function runImageBatch(ratio) {
+  const useRatio = vsrEnabled() && ratio > 1 ? Math.min(4, ratio) : 1;
+  for (let i = 0; i < batchRows.length; i++) {
+    const r = batchRows[i];
+    if (!IMAGE_EXTS.includes(extOf(r.path))) continue;
+    const row = $(`batch-row-${i}`);
+    if (!row) continue;
+    const bar = row.querySelector('.row-bar'), label = row.querySelector('.row-status');
+    if (batchImageCancel) {
+      bar.hidden = true;
+      label.classList.remove('ok', 'bad');
+      label.textContent = t('batch.cancelled');
+      continue;
+    }
+    label.classList.remove('ok', 'bad');
+    bar.hidden = true;
+    label.textContent = t('batch.processing');
+    try {
+      const info = await invoke('media_info', { path: r.path });
+      let outArgs = {};
+      if (useRatio > 1) {
+        const w = Math.max(32, Math.min(8192, Math.round(info.width * useRatio))) & ~1;
+        const h = Math.max(32, Math.min(8192, Math.round(info.height * useRatio))) & ~1;
+        outArgs = { outputWidth: w, outputHeight: h };
+      }
+      const stem = r.name.replace(/\.[^.]+$/, '');
+      const destination = await invoke('unique_image_destination', { dir: batchDir, stem });
+      await invoke('save_png', { path: r.path, destination, runtime: $('runtime').value, settings: settings(), ...outArgs });
+      label.textContent = t('batch.done');
+      label.classList.add('ok');
+    } catch (e) {
+      log(`批量图片: ${e}`);
+      label.textContent = t('batch.failed');
+      label.classList.add('bad');
+      label.title = String(e);
+    }
+  }
+}
+
 $('batch-start').onclick = async () => {
   if (batchRunning) return;
   if (!batchRows.length) { statusT('status.chooseVideos'); return; }
   if (!batchDir) { statusT('status.chooseOutputDir'); return; }
+  const ratio = (vsrEnabled() && sourceSize() && outputSize()) ? $('out-width').value / sourceSize()[0] : 1;
+  const wanted = batchMode === 'video' ? VIDEO_EXTS : IMAGE_EXTS;
+  if (!batchRows.some(r => wanted.includes(extOf(r.path)))) { statusT(batchMode === 'video' ? 'status.chooseVideos' : 'status.chooseImages'); return; }
   batchRunning = true;
+  batchImageCancel = false;
   $('batch-start').disabled = true;
   $('batch-add').disabled = true;
   $('batch-cancel').hidden = false;
-  startBatchPoll();
+  if (batchMode === 'video') startBatchPoll();
   try {
-    await invoke('batch_export', {
-      paths: batchRows.map(r => r.path),
-      outputDir: batchDir,
-      runtime: $('runtime').value,
-      settings: settings(),
-      outputRatio: (vsrEnabled() && sourceSize() && outputSize()) ? $('out-width').value / sourceSize()[0] : null,
-    });
+    if (batchMode === 'video') {
+      await invoke('batch_export', {
+        paths: batchRows.filter(r => VIDEO_EXTS.includes(extOf(r.path))).map(r => r.path),
+        outputDir: batchDir,
+        runtime: $('runtime').value,
+        settings: settings(),
+        outputRatio: vsrEnabled() ? ratio : null,
+      });
+    } else {
+      await runImageBatch(ratio);
+    }
   } catch (e) {
     log(`批量: ${e}`);
     statusT('status.batchExportFailed',{error:e});
   }
-  finishBatchPoll();
+  if (batchMode === 'video') {
+    finishBatchPoll();
+  } else {
+    batchRunning = false;
+    $('batch-start').disabled = false;
+    $('batch-add').disabled = false;
+    $('batch-cancel').hidden = true;
+  }
 };
 $('batch-cancel').onclick = () => {
+  batchImageCancel = true;
   invoke('batch_cancel');
   statusT('status.cancelBatch');
 };
@@ -541,6 +682,8 @@ function refreshLocalizedUi() {
     if (latestExportProgress) renderExportProgress(latestExportProgress);
   $('export-pause').textContent=exportPaused?t('progress.resume'):t('progress.pause');
   syncEncoderControls();
+  updateSizeNote();
+  updateInterpNote();
   const vsrOption=$('upscale').querySelector('option[value=vsr]');
   if (vsrOption?.disabled) vsrOption.textContent=t('upscale.vsrUnavailable');
   updateUpscaleAvailability();
@@ -554,6 +697,8 @@ function refreshLocalizedUi() {
   if (!$('batch-modal').hidden) {
     $('batch-summary').textContent=batchSummary();
     renderBatchRows();
+    syncBatchModeSwitch();
+    syncBatchModeText();
     invoke('batch_state').then(applyBatchState).catch(() => {});
   }
 }

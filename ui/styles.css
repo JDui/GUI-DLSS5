@@ -53,6 +53,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .workspace{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:8px}
 .preview-card{min-height:520px;display:flex;flex-direction:column;padding:10px 12px}
 .card-head{justify-content:space-between;margin-bottom:8px}
+.card-head #source{flex:1;min-width:0;text-align:center;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .card-head small{font-weight:400;color:var(--muted);margin-left:8px;letter-spacing:0}
 
 /* 预览舞台 */
@@ -80,17 +81,22 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
 /* 时间轴与传输控制 */
 .timeline{display:flex;align-items:center;gap:10px;padding-top:8px;color:var(--muted);font-variant-numeric:tabular-nums}
+.timeline[hidden]{display:none}
 .timeline input{flex:1}
 .transport{padding-top:8px;color:var(--muted)}
 .transport span{margin-left:auto}
+#transport-center{display:flex;align-items:center;gap:6px;margin:0 auto}
+/* 仅在载入视频 / GIF 时显示逐帧与播放控制条（hidden 需显式兜底，否则被上面的 display:flex 覆盖） */
+#transport-center[hidden]{display:none}
+#transport-center button{padding:4px 10px;font-size:12px}
 #ab-option{display:none;align-items:center;gap:4px;line-height:1}
 
 /* 药丸视图切换 */
-#view-switch{position:relative;display:inline-flex;align-items:center;padding:3px;border:1px solid var(--edge);border-radius:999px;background:var(--field)}
-#view-switch .view-opt{position:relative;z-index:1;border:none;background:transparent;border-radius:999px;padding:4px 12px;color:var(--muted);font-weight:600;box-shadow:none}
-#view-switch .view-opt:hover{background:transparent;color:var(--text)}
-#view-switch .view-opt.active{color:var(--on-accent)}
-#view-thumb{position:absolute;z-index:0;top:3px;bottom:3px;left:3px;width:0;border-radius:999px;background:var(--accent);transition:left .18s ease,width .18s ease}
+#view-switch,#batch-mode{position:relative;display:inline-flex;align-items:center;padding:3px;border:1px solid var(--edge);border-radius:999px;background:var(--field)}
+#view-switch .view-opt,#batch-mode .view-opt{position:relative;z-index:1;border:none;background:transparent;border-radius:999px;padding:4px 12px;color:var(--muted);font-weight:600;box-shadow:none}
+#view-switch .view-opt:hover,#batch-mode .view-opt:hover{background:transparent;color:var(--text)}
+#view-switch .view-opt.active,#batch-mode .view-opt.active{color:var(--on-accent)}
+#view-thumb,#batch-mode-thumb{position:absolute;z-index:0;top:3px;bottom:3px;left:3px;width:0;border-radius:999px;background:var(--accent);transition:left .18s ease,width .18s ease}
 
 /* 侧栏与标签页 */
 aside{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px}
@@ -151,7 +157,9 @@ footer #status{margin-left:auto;min-width:0;color:var(--muted);overflow:hidden;t
 .ratio-row button{flex:1;padding:6px 0;font-variant-numeric:tabular-nums}
 .ratio-row button.active{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
 .tab-page .hint{display:block;color:var(--muted);font-weight:400;margin:8px 0;line-height:1.6;font-size:12px}
+.settings .ctl-sep{height:1px;background:var(--edge);margin:24px 0 12px}
 .tab-page .control select{width:100%}
+select:disabled,input:disabled{opacity:.45;cursor:not-allowed}
 
 /* 导出进度 */
 .export-progress{display:flex;align-items:center;gap:8px;flex:1 1 360px;min-width:360px;max-width:560px}

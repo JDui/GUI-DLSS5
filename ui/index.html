@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title data-i18n="app.title">DLSS5 Neural Render v0.1.26</title>
+  <title data-i18n="app.title">DLSS5 Neural Render v0.1.46</title>
   <link rel="stylesheet" href="styles.css"/>
   <link rel="stylesheet" href="compare.css"/>
 </head>
@@ -13,7 +13,7 @@
       <b data-i18n="import.media">素材</b>
       <button id="open" class="primary" data-i18n="import.open">＋ 导入图片 / 视频</button>
       <button id="paste" data-i18n="import.paste">粘贴图片</button>
-      <span id="source" data-i18n="source.empty">尚未选择图片或视频</span>
+      <button id="batch-open" data-i18n="footer.batch">批量处理</button>
       <div class="runtime">
         <label data-i18n="gpu.label">显卡</label>
         <span id="gpu-name" class="gpu-name">检测中…</span>
@@ -39,6 +39,7 @@
       <article class="preview-card">
         <div class="card-head">
           <b><span data-i18n="preview.title">实时预览</span><small data-i18n="preview.subtitle">预览按窗口分辨率渲染；导出保持输出分辨率</small></b>
+          <span id="source" data-i18n="source.empty">尚未选择图片或视频</span>
           <button id="zoom" data-i18n="preview.fit">适合窗口</button>
         </div>
         <div id="stage" tabindex="0">
@@ -56,7 +57,7 @@
           <div id="compare-right" class="compare-label" data-i18n="compare.dlss">DLSS</div>
           <div id="split-line"></div>
         </div>
-        <div class="timeline">
+        <div class="timeline" id="timeline" hidden>
           <input id="frame" type="range" min="0" max="0" value="0"/>
           <span id="frame-label">帧 0 / 0</span>
         </div>
@@ -79,20 +80,26 @@
               <option value="vertical" data-i18n="ab.vertical">上下堆叠</option>
             </select>
           </label>
-          <button id="play" data-i18n="play.play">▶ 播放</button>
+          <div id="transport-center" hidden>
+            <button id="frame-first" data-i18n-title="transport.first" title="到最前">I&lt;</button>
+            <button id="frame-prev" data-i18n-title="transport.prev" title="上一帧">.&lt;</button>
+            <button id="play" data-i18n="play.play">▶ 播放</button>
+            <button id="frame-next" data-i18n-title="transport.next" title="下一帧">&gt;.</button>
+            <button id="frame-last" data-i18n-title="transport.last" title="到最后">&gt;|</button>
+          </div>
           <span id="hint">按住左键查看原图 · 中键 / 右键拖动画面</span>
         </div>
       </article>
 
       <aside>
         <nav class="tabs">
-          <button class="tab active" data-tab="dlss" data-i18n="tabs.dlss" data-i18n-title="dlss.title" title="DLSS 参数">DLSS 参数</button>
-          <button class="tab" data-tab="upscale" data-i18n="tabs.upscale" data-i18n-title="upscale.title" title="增益">增益</button>
+          <button class="tab active" data-tab="dlss" data-i18n="tabs.dlss" data-i18n-title="dlss.title" title="神经渲染 参数">NR</button>
+          <button class="tab" data-tab="upscale" data-i18n="tabs.upscale" data-i18n-title="upscale.title" title="增强">增强</button>
           <button class="tab" data-tab="encoder" data-i18n="tabs.encoder" data-i18n-title="encoder.title" title="编码器">编码器</button>
         </nav>
 
         <section class="settings tab-page" id="tab-dlss">
-          <h2 data-i18n="dlss.title">DLSS 参数</h2>
+          <h2 data-i18n="dlss.title">神经渲染 参数</h2>
           <label class="multi-pass-toggle">
             <span data-i18n="multiPass.label">多重 Pass 模式</span>
             <input id="multi-pass" class="pill-switch" type="checkbox" role="switch" aria-controls="pass-control"/>
@@ -117,7 +124,7 @@
           <div class="control">
             <b><span data-i18n="intensity.label">处理强度</span><span class="info" data-param="intensity">i</span></b>
             <input id="intensity-num" type="number" min="0" max="1" step="0.001" value="1"/>
-            <small data-i18n="intensity.hint">控制 DLSS 效果的整体权重</small>
+            <small data-i18n="intensity.hint">控制神经渲染效果的整体权重</small>
             <input id="intensity" type="range" min="0" max="1" step="0.001" value="1"/>
           </div>
           <div class="control">
@@ -141,7 +148,7 @@
           <div class="control">
             <b><span data-i18n="autoMask.label">使用自动掩码</span><span class="info" data-param="autoMask">i</span></b>
             <input id="auto-mask" type="checkbox"/>
-            <small data-i18n="autoMask.hint">让 DLSS 自动识别需要保护的区域</small>
+            <small data-i18n="autoMask.hint">让神经渲染自动识别需要保护的区域</small>
           </div>
           <div class="control">
             <b><span data-i18n="uiCorrection.label">UI 修正</span><span class="info" data-param="uiCorrection">i</span></b>
@@ -151,73 +158,68 @@
         </section>
 
         <section class="settings tab-page" id="tab-upscale" hidden>
-          <h2 data-i18n="upscale.title">增益</h2>
+          <h2 data-i18n="upscale.title">增强</h2>
           <div class="out-size">
-            <b><span data-i18n="output.size">输出尺寸</span><small id="size-note"></small></b>
+            <b><span data-i18n="output.size">输出规格</span><small id="size-note"></small></b>
             <span class="size-fields" data-i18n-title="output.customTitle" title="自定义输出分辨率；预览任一单边最高 4520，导出按此尺寸处理">
               <input id="out-width" type="number" min="32" max="8192" step="2" data-i18n-placeholder="output.width" placeholder="宽"/>
               <i>×</i>
               <input id="out-height" type="number" min="32" max="8192" step="2" data-i18n-placeholder="output.height" placeholder="高"/>
             </span>
+          </div>
+          <div class="ctl-sep"></div>
+          <label>
+            <span class="param-title"><span data-i18n="upscale.engine">放大引擎</span><span class="info" data-param="upscaleEngine">i</span></span>
+            <select id="upscale">
+              <option value="none" data-i18n="upscale.none">关闭（不放大）</option>
+              <option value="vsr" selected data-i18n="upscale.vsr">RTX VSR</option>
+            </select>
             <span class="ratio-row">
               <button id="ratio-1" data-i18n-title="output.ratio1" title="按原始尺寸输出">X1</button>
               <button id="ratio-2" data-i18n-title="output.ratio2" title="按原始尺寸的 2 倍输出">X2</button>
               <button id="ratio-4" data-i18n-title="output.ratio4" title="按原始尺寸的 4 倍输出">X4</button>
             </span>
-          </div>
-          <label>
-            <span class="param-title" data-i18n="upscale.engine">放大引擎</span>
-            <select id="upscale">
-              <option value="none" data-i18n="upscale.none">关闭（不放大）</option>
-              <option value="vsr" selected data-i18n="upscale.vsr">RTX VSR</option>
-            </select>
           </label>
-          <small class="hint" data-i18n="upscale.hint">放大依赖 RTX VSR（NVIDIA 网络超分）：需 RTX 20 系及以上显卡与 550+ 驱动，程序目录需带 nvngx_vsr.dll 与 rtx_vsr_host.dll。关闭或不可用时，导出不会超过原始分辨率，X2 / X4 按钮也会禁用。</small>
           <div class="control">
-            <b data-i18n="upscale.quality">VSR 质量</b>
+            <b><span data-i18n="upscale.quality">VSR 质量</span><span class="info" data-param="vsrQuality">i</span></b>
             <select id="vsr-quality">
-              <option value="1" data-i18n="upscale.quality1">1 低（最快）</option>
-              <option value="2" data-i18n="upscale.quality2">2 中</option>
-              <option value="3" data-i18n="upscale.quality3">3 高</option>
-              <option value="4" selected data-i18n="upscale.quality4">4 超高（最佳）</option>
+              <option value="1" data-i18n="upscale.quality1">1x</option>
+              <option value="2" data-i18n="upscale.quality2">2x</option>
+              <option value="3" data-i18n="upscale.quality3">3x</option>
+              <option value="4" selected data-i18n="upscale.quality4">4x</option>
             </select>
-            <small data-i18n="upscale.qualityHint">档位越高细节越好、耗时越长</small>
           </div>
+          <div class="ctl-sep"></div>
           <div class="control">
-            <b data-i18n="interp.label">插帧</b>
+            <b><span data-i18n="interp.label">插帧</span><span class="info" data-param="interp">i</span></b>
             <select id="interp">
               <option value="1" selected data-i18n="interp.off">关闭</option>
               <option value="2">2x</option>
               <option value="3">3x</option>
               <option value="4">4x</option>
             </select>
-            <small data-i18n="interp.hint">用 RIFE v4.6 在帧间生成中间帧（导出时生效）</small>
             <small id="interp-note"></small>
           </div>
+          <div class="ctl-sep"></div>
           <div class="control">
-            <b data-i18n="post.brightness">亮度</b>
+            <b><span data-i18n="post.brightness">亮度</span><span class="info" data-param="postRange">i</span></b>
             <input id="post-brightness-num" type="number" min="0" max="2" step="0.05" value="1"/>
-            <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
             <input id="post-brightness" type="range" min="0" max="2" step="0.01" value="1"/>
           </div>
           <div class="control">
-            <b data-i18n="post.contrast">对比度</b>
+            <b><span data-i18n="post.contrast">对比度</span><span class="info" data-param="postRange">i</span></b>
             <input id="post-contrast-num" type="number" min="0" max="2" step="0.05" value="1"/>
-            <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
             <input id="post-contrast" type="range" min="0" max="2" step="0.01" value="1"/>
           </div>
           <div class="control">
-            <b data-i18n="post.saturation">饱和度</b>
+            <b><span data-i18n="post.saturation">饱和度</span><span class="info" data-param="postRange">i</span></b>
             <input id="post-saturation-num" type="number" min="0" max="2" step="0.05" value="1"/>
-            <small data-i18n="post.rangeHint">0–2，默认 1 不变</small>
             <input id="post-saturation" type="range" min="0" max="2" step="0.01" value="1"/>
           </div>
           <div class="control">
-            <b data-i18n="post.perPass">多 Pass 逐轮应用</b>
+            <b><span data-i18n="post.perPass">多 Pass 逐轮应用</span><span class="info" data-param="perPass">i</span></b>
             <input id="post-per-pass" type="checkbox"/>
-            <small data-i18n="post.perPassHint">开启时每轮 DLSS Pass 后应用后处理；关闭时仅在最后一轮后应用</small>
           </div>
-          <small class="hint" data-i18n="post.hint">以上后处理对预览和导出均生效。</small>
         </section>
 
         <section class="settings tab-page" id="tab-encoder" hidden>
@@ -250,7 +252,6 @@
     <footer>
       <button id="export-current" data-i18n="footer.exportCurrent">导出当前画面</button>
       <button id="export-full" class="primary" data-i18n="footer.exportVideo">导出 DLSS 视频</button>
-      <button id="batch-open" data-i18n="footer.batch">批量处理</button>
       <button id="copy" data-i18n="footer.copy">复制当前画面</button>
       <div id="export-progress-wrap" class="export-progress" hidden>
         <progress id="export-progress" max="1" value="0"></progress>
@@ -264,11 +265,19 @@
 
   <div id="batch-modal" hidden>
     <div class="batch-panel">
-      <div class="batch-head"><b data-i18n="batch.title">批量处理</b><button id="batch-close" data-i18n-title="batch.close" title="关闭">✕</button></div>
+      <div class="batch-head">
+        <b data-i18n="batch.title">批量处理</b>
+        <div id="batch-mode" role="group" data-i18n-aria-label="batch.title" aria-label="批量处理">
+          <span id="batch-mode-thumb"></span>
+          <button type="button" class="view-opt active" data-batch="video" data-i18n="batch.tabVideo">视频与GIF</button>
+          <button type="button" class="view-opt" data-batch="image" data-i18n="batch.tabImage">静态图片</button>
+        </div>
+        <button id="batch-close" data-i18n-title="batch.close" title="关闭">✕</button>
+      </div>
       <div id="batch-summary" class="batch-summary"></div>
       <div class="batch-toolbar">
         <button id="batch-add" class="primary" data-i18n="batch.add">＋ 选择视频</button>
-        <span class="batch-hint" data-i18n="batch.hint">支持 mp4 / avi / mov / mkv / webm / wmv / m4v / gif，可多选</span>
+        <span id="batch-hint" class="batch-hint" data-i18n="batch.hint">支持 mp4 / avi / mov / mkv / webm / wmv / m4v / gif，可多选</span>
       </div>
       <div id="batch-list"><div class="batch-empty" data-i18n="batch.empty">尚未选择视频</div></div>
       <div class="batch-foot">

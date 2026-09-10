@@ -419,6 +419,8 @@ struct AppState {
     vsr_disabled: AtomicBool,
     rife: Mutex<Option<RifeHost>>,
     rife_disabled: AtomicBool,
+    // 预览插帧缓存：记录上一张 NR 渲染结果，顺序播放时避免重复推理
+    interp_cache: Mutex<Option<InterpCache>>,
     media: Mutex<HashMap<String, MediaInfo>>,
     decoder: Mutex<Option<VideoDecoder>>,
     temp_counter: AtomicU64,
@@ -895,6 +897,10 @@ fn render_dlss_frame(
     reset: bool,
 ) -> Result<RgbaImage, String> {
     let (w, h) = image.dimensions();
+    // 处理强度为 0 时不启用 NR：跳过推理直接返回原图（放大 / 插帧 / 后处理仍照常执行）
+    if settings.intensity <= 0.0 {
+        return Ok(image);
+    }
     let input = image.into_raw();
     let output = {
         let mut host = state.host.lock().map_err(|_| "DLSS 会话锁定失败")?;
@@ -1230,17 +1236,24 @@ fn choose_media() -> Option<String> {
 }
 
 #[tauri::command]
-fn choose_export(video: bool) -> Option<String> {
+fn choose_export(video: bool, source: Option<String>) -> Option<String> {
+    // 默认输出名：原文件名_DNR.后缀
+    let stem = source
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "DNR_output".to_string());
+    let default_name = if video { format!("{stem}_DNR.mp4") } else { format!("{stem}_DNR.png") };
     let dialog = rfd::FileDialog::new();
     let selected = if video {
         dialog
             .add_filter("MP4 视频", &["mp4"])
-            .set_file_name("dlss_output.mp4")
+            .set_file_name(&default_name)
             .save_file()
     } else {
         dialog
             .add_filter("PNG 图片", &["png"])
-            .set_file_name("dlss_output.png")
+            .set_file_name(&default_name)
             .save_file()
     };
     selected.map(|p| p.to_string_lossy().into_owned())
@@ -1504,6 +1517,14 @@ async fn save_png(
     result
 }
 
+// 预览插帧缓存条目：路径 + 基帧号 + 参数签名 + 渲染结果
+struct InterpCache {
+    path: String,
+    frame: u32,
+    signature: String,
+    rgba: Vec<u8>,
+}
+
 // 解码后按需把帧升到预览目标尺寸：原图侧（nearest）用最近邻，单 Pass 的 DLSS 侧走 RTX VSR；
 // 多重 Pass 则保留源分辨率，交由调用方在第 1 次 DLSS 后执行 VSR。
 #[allow(clippy::too_many_arguments)]
@@ -1585,19 +1606,34 @@ async fn render_frame_png(
     output_height: Option<u32>,
 ) -> Result<Response, String> {
     let target = sanitize_output(output_width, output_height);
+    let rendered = render_preview_frame(&state, &path, frame, &runtime, &settings, max_side, target)?;
+    let (w, h) = rendered.dimensions();
+    Ok(Response::new(rgba_png(&rendered.into_raw(), w, h)?))
+}
+
+// 单帧预览渲染：解码 → （必要时 VSR）→ NR 多 Pass → 后处理
+fn render_preview_frame(
+    state: &AppState,
+    path: &str,
+    frame: u32,
+    runtime: &str,
+    settings: &RenderSettings,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+) -> Result<RgbaImage, String> {
     let (source_w, source_h) = state
         .media
         .lock()
         .map_err(|_| "媒体信息锁定失败")?
-        .get(&path)
+        .get(path)
         .map(|info| (info.width, info.height))
         .ok_or("媒体尚未载入")?;
     let vsr_target = preview_target_dimensions_for_size(source_w, source_h, max_side, target);
     let defer_vsr =
-        should_defer_vsr_until_after_first_pass(&settings, (source_w, source_h), Some(vsr_target));
+        should_defer_vsr_until_after_first_pass(settings, (source_w, source_h), Some(vsr_target));
     let image = decoded_preview_frame(
-        &state,
-        &path,
+        state,
+        path,
         frame,
         max_side,
         target,
@@ -1606,17 +1642,69 @@ async fn render_frame_png(
         false,
         settings.vsr_quality,
     )?;
-    let rendered = render_with_pass_order(
-        &state,
-        &runtime,
+    render_with_pass_order(
+        state,
+        runtime,
         image,
-        &settings,
+        settings,
         true,
         defer_vsr.then_some(vsr_target),
         false,
-    )?;
-    let (w, h) = rendered.dimensions();
-    Ok(Response::new(rgba_png(&rendered.into_raw(), w, h)?))
+    )
+}
+
+// 预览插帧：在 frame 与 frame+1 的 NR 渲染结果之间用 RIFE 生成 t 时刻画面（t∈[0,1)）
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn render_frame_interp_png(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    frame: u32,
+    t: f32,
+    runtime: String,
+    settings: RenderSettings,
+    max_side: u32,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+) -> Result<Response, String> {
+    let target = sanitize_output(output_width, output_height);
+    let signature = serde_json::to_string(&settings).unwrap_or_default();
+    let t = t.clamp(0.0, 1.0);
+    let next = frame + 1;
+    // 下一帧：插帧终点的 NR 渲染结果
+    let b_image = render_preview_frame(&state, &path, next, &runtime, &settings, max_side, target)?;
+    let (w, h) = b_image.dimensions();
+    let b = b_image.into_raw();
+    let pixels = b.len();
+    // 当前帧：顺序播放时命中缓存可少渲染一次
+    let a = {
+        let mut cache = state.interp_cache.lock().map_err(|_| "插帧缓存锁定失败")?;
+        match cache.as_ref() {
+            Some(c) if c.path == path && c.frame == frame && c.signature == signature && c.rgba.len() == pixels => {
+                c.rgba.clone()
+            }
+            _ => {
+                let image = render_preview_frame(&state, &path, frame, &runtime, &settings, max_side, target)?;
+                let rgba = image.into_raw();
+                *cache = Some(InterpCache {
+                    path: path.clone(),
+                    frame,
+                    signature: signature.clone(),
+                    rgba: rgba.clone(),
+                });
+                rgba
+            }
+        }
+    };
+    // 缓存推进到下一帧，供后续连续插帧复用
+    {
+        let mut cache = state.interp_cache.lock().map_err(|_| "插帧缓存锁定失败")?;
+        *cache = Some(InterpCache { path, frame: next, signature, rgba: b.clone() });
+    }
+    let rgba = rife_with(&state, |host| unsafe { host.interp(&a, &b, w, h, t) })
+        // RIFE 失败时按时间取近邻帧兜底，保证预览不中断
+        .unwrap_or_else(|| if t < 0.5 { a } else { b });
+    Ok(Response::new(rgba_png(&rgba, w, h)?))
 }
 
 // ffmpeg stderr 留尾：去掉空字节，最多保留末尾 400 字符
@@ -1721,10 +1809,10 @@ struct BatchProgress {
 }
 
 fn unique_destination(dir: &std::path::Path, stem: &str) -> std::path::PathBuf {
-    let mut candidate = dir.join(format!("{stem}_dlss.mp4"));
+    let mut candidate = dir.join(format!("{stem}_DNR.mp4"));
     let mut n = 1;
     while candidate.exists() {
-        candidate = dir.join(format!("{stem}_dlss_{n}.mp4"));
+        candidate = dir.join(format!("{stem}_DNR_{n}.mp4"));
         n += 1;
     }
     candidate
@@ -2165,6 +2253,36 @@ fn choose_media_multi() -> Option<Vec<String>> {
         })
 }
 
+// 选择多个静态图片文件（批量处理入口）
+#[tauri::command]
+fn choose_images_multi() -> Option<Vec<String>> {
+    rfd::FileDialog::new()
+        .add_filter("图片", &["png", "jpg", "jpeg", "webp", "bmp"])
+        .pick_files()
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        })
+}
+
+// 为批量静态图片生成不冲突的输出路径（与 unique_destination 同规则，扩展名为 png）
+#[tauri::command]
+fn unique_image_destination(dir: String, stem: String) -> Result<String, String> {
+    let dir_path = std::path::Path::new(&dir);
+    if !dir_path.is_dir() {
+        return Err("输出文件夹不存在".into());
+    }
+    let mut candidate = dir_path.join(format!("{stem}_DNR.png"));
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = dir_path.join(format!("{stem}_DNR_{n}.png"));
+        n += 1;
+    }
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
 // 选择输出文件夹（批量处理）
 #[tauri::command]
 fn choose_directory() -> Option<String> {
@@ -2450,6 +2568,7 @@ fn main() {
                 vsr_disabled: AtomicBool::new(false),
                 rife: Mutex::new(None),
                 rife_disabled: AtomicBool::new(false),
+                interp_cache: Mutex::new(None),
                 media: Mutex::new(HashMap::new()),
                 decoder: Mutex::new(None),
                 temp_counter: AtomicU64::new(0),
@@ -2484,11 +2603,14 @@ fn main() {
             save_data_png,
             frame_png,
             render_frame_png,
+            render_frame_interp_png,
             export_video,
             batch_export,
             batch_state,
             batch_cancel,
             choose_media_multi,
+            choose_images_multi,
+            unique_image_destination,
             choose_directory,
             vsr_probe
         ])
