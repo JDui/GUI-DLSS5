@@ -422,6 +422,12 @@ struct AppState {
     // 预览插帧缓存：记录上一张 NR 渲染结果，顺序播放时避免重复推理
     interp_cache: Mutex<Option<InterpCache>>,
     media: Mutex<HashMap<String, MediaInfo>>,
+    // 图片序列清单路径 → 有序图片文件列表（预览直接按帧号读取对应文件）
+    sequences: Mutex<HashMap<String, Vec<String>>>,
+    // 序列帧直接解码缓存：(清单路径, 帧号) → (宽, 高, 原始分辨率 RGBA)
+    sequence_frames: Mutex<VecDeque<((String, u32), (u32, u32, Vec<u8>))>>,
+    // 图片序列的音轨映射：清单路径 → 导出时混入的音乐文件
+    sequence_music: Mutex<HashMap<String, String>>,
     decoder: Mutex<Option<VideoDecoder>>,
     temp_counter: AtomicU64,
     gpu: GpuInfo,
@@ -580,6 +586,24 @@ fn tool(name: &str) -> Result<Command, String> {
     command.creation_flags(CREATE_NO_WINDOW);
     Ok(command)
 }
+// .ffconcat 清单（图片序列虚拟视频）需显式 concat demuxer 与 -safe 0 才能读绝对路径
+fn concat_input_args(path: &str) -> Vec<&'static str> {
+    if path.to_ascii_lowercase().ends_with(".ffconcat") {
+        vec!["-f", "concat", "-safe", "0"]
+    } else {
+        Vec::new()
+    }
+}
+// .ffconcat 清单不采纳末条目的 duration（ffmpeg 已知行为），导出的 fps 滤镜会把
+// 末帧按图片默认 1/25s 时长拉长出多余帧；按导入注册的总帧数硬性截断
+fn concat_frame_cap(path: &str, frames: u32) -> Vec<String> {
+    if path.to_ascii_lowercase().ends_with(".ffconcat") {
+        vec!["-frames:v".into(), frames.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn probe_u32(value: &serde_json::Value) -> Option<u32> {
     value
         .as_u64()
@@ -998,6 +1022,12 @@ fn spawn_decoder(
     max_side: u32,
     start_frame: u32,
 ) -> Result<VideoDecoder, String> {
+    // concat 清单继承图片流的 1/25 时间基，秒级 -ss 定位不可靠，序列只能顺序解码
+    let start_frame = if info.path.to_ascii_lowercase().ends_with(".ffconcat") {
+        0
+    } else {
+        start_frame
+    };
     let mut command = tool("ffmpeg")?;
     command.args(["-v", "error"]);
     if start_frame > 0 {
@@ -1007,12 +1037,22 @@ fn spawn_decoder(
         ]);
     }
     let mut child = command
+        .args(concat_input_args(&info.path))
         .args([
             "-i",
             &info.path,
             "-an",
             "-vf",
             &format!("scale={width}:{height}:flags=fast_bilinear"),
+        ])
+        // concat 清单继承图片流的 1/25 时间基，duration 量化后相邻帧共享 pts，
+        // 输出端默认帧率同步会把重复时间戳的帧丢掉一半；passthrough 强制逐帧输出
+        .args(if info.path.to_ascii_lowercase().ends_with(".ffconcat") {
+            vec!["-vsync", "0"]
+        } else {
+            Vec::new()
+        })
+        .args([
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -1037,6 +1077,89 @@ fn spawn_decoder(
     })
 }
 
+// 序列帧缓存上限与单帧大小上限（约 4K RGBA）
+const SEQUENCE_FRAME_CACHE_ENTRIES: usize = 3;
+const SEQUENCE_FRAME_CACHE_BYTES: usize = 40 * 1024 * 1024;
+
+// 图片序列预览：按帧号直接读取对应图片文件，不走 concat 顺序解码，
+// 跳转到任意帧的开销恒定为单张图片解码。非序列路径返回 None。
+fn decode_sequence_frame(
+    state: &AppState,
+    path: &str,
+    frame: u32,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+    vsr_mode: bool,
+) -> Option<Result<(Vec<u8>, u32, u32), String>> {
+    let paths = state.sequences.lock().ok()?.get(path).cloned()?;
+    Some(decode_sequence_frame_inner(
+        state, path, paths, frame, max_side, target, vsr_mode,
+    ))
+}
+
+fn decode_sequence_frame_inner(
+    state: &AppState,
+    playlist: &str,
+    paths: Vec<String>,
+    frame: u32,
+    max_side: u32,
+    target: Option<(u32, u32)>,
+    vsr_mode: bool,
+) -> Result<(Vec<u8>, u32, u32), String> {
+    let frame = frame.min(paths.len().saturating_sub(1) as u32);
+    let (img_w, img_h, rgba) = {
+        let cache = state.sequence_frames.lock().map_err(|_| "序列帧缓存锁定失败")?;
+        let hit = cache
+            .iter()
+            .find(|((cached_path, cached_frame), _)| cached_path == playlist && *cached_frame == frame)
+            .map(|(_, value)| value.clone());
+        match hit {
+            Some(cached) => cached,
+            None => {
+                drop(cache);
+                let image = image::open(&paths[frame as usize])
+                    .map_err(|e| format!("无法读取序列帧 {frame}（{}）: {e}", paths[frame as usize]))?
+                    .to_rgba8();
+                let (img_w, img_h) = image.dimensions();
+                let rgba = image.into_raw();
+                if rgba.len() <= SEQUENCE_FRAME_CACHE_BYTES {
+                    let mut cache = state
+                        .sequence_frames
+                        .lock()
+                        .map_err(|_| "序列帧缓存锁定失败")?;
+                    cache.push_back(((playlist.to_string(), frame), (img_w, img_h, rgba.clone())));
+                    while cache.len() > SEQUENCE_FRAME_CACHE_ENTRIES {
+                        cache.pop_front();
+                    }
+                }
+                (img_w, img_h, rgba)
+            }
+        }
+    };
+    // 与视频解码保持同一目标尺寸逻辑：VSR 放大时保持原始分辨率交给 GPU
+    let (base_w, base_h) = state
+        .media
+        .lock()
+        .ok()
+        .and_then(|media| media.get(playlist).map(|info| (info.width, info.height)))
+        .unwrap_or((img_w, img_h));
+    let (pw, ph) = target
+        .map(|(w, h)| preview_dimensions(w, h, max_side))
+        .unwrap_or_else(|| preview_dimensions(base_w, base_h, max_side));
+    let bypass = vsr_mode && pw > base_w && ph > base_h;
+    let (tw, th) = if bypass {
+        (img_w, img_h)
+    } else {
+        (pw, ph)
+    };
+    if (tw, th) == (img_w, img_h) {
+        return Ok((rgba, img_w, img_h));
+    }
+    let image = RgbaImage::from_raw(img_w, img_h, rgba).ok_or("无效序列帧")?;
+    let resized = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+    Ok((resized.into_raw(), tw, th))
+}
+
 fn decode_video_frame(
     state: &AppState,
     path: &str,
@@ -1045,6 +1168,9 @@ fn decode_video_frame(
     target: Option<(u32, u32)>,
     vsr_mode: bool,
 ) -> Result<(Vec<u8>, u32, u32), String> {
+    if let Some(sequence) = decode_sequence_frame(state, path, frame, max_side, target, vsr_mode) {
+        return sequence;
+    }
     let info = state
         .media
         .lock()
@@ -1173,6 +1299,103 @@ fn bake_gif(state: &AppState, source: &str) -> Result<String, String> {
         ));
     }
     Ok(destination.to_string_lossy().into_owned())
+}
+
+// 图片序列导入：写 .ffconcat 清单注册为"虚拟视频"，
+// 预览与导出经 concat demuxer 直接解码原始图片，不生成中间视频文件。
+#[tauri::command]
+async fn load_image_sequence(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+    fps: f64,
+    music: Option<String>,
+) -> Result<MediaInfo, String> {
+    if paths.is_empty() {
+        return Err("未选择图片".into());
+    }
+    let fps = fps.clamp(1.0, 240.0);
+    // concat demuxer 要求所有输入流参数一致，导入时校验尺寸统一。
+    // 校验并行执行：数千帧的序列在慢盘上逐个读头会明显拖住"确定"按钮。
+    let (width, height) = {
+        let chunk_size = paths.len().div_ceil(16).max(1);
+        let results: Vec<Result<Vec<(u32, u32)>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|path| {
+                                image::image_dimensions(path)
+                                    .map_err(|e| format!("无法读取图片 {path}: {e}"))
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err("图片尺寸校验线程异常退出".into()),
+                })
+                .collect()
+        });
+        let mut dims: Option<(u32, u32)> = None;
+        for result in results {
+            for (w, h) in result? {
+                match dims {
+                    None => dims = Some((w, h)),
+                    Some((pw, ph)) if (pw, ph) != (w, h) => {
+                        return Err(format!(
+                            "图片尺寸不一致：{pw}×{ph} 与 {w}×{h}，请先统一序列尺寸"
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        dims.ok_or("未选择图片")?
+    };
+    let id = state.temp_counter.fetch_add(1, Ordering::Relaxed);
+    let playlist = state.temp_dir.join(format!("seq_{id}.ffconcat"));
+    // duration 必须向下舍入：concat 的 -ss 按"目标时间所在段"floor 定位，
+    // pts 一旦进位到晚于 frame/fps，seek 就会落到前一帧
+    let duration = format!("{:.6}", (1.0 / fps * 1e6).floor() / 1e6);
+    let mut script = String::from("ffconcat version 1.0\n");
+    for path in &paths {
+        let escaped = path.replace('\\', "/").replace('\'', "'\\''");
+        script.push_str(&format!("file '{escaped}'\nduration {duration}\n"));
+    }
+    std::fs::write(&playlist, script).map_err(|e| format!("无法写入序列清单: {e}"))?;
+    let playlist_path = playlist.to_string_lossy().into_owned();
+    let info = MediaInfo {
+        path: playlist_path.clone(),
+        source_path: paths[0].clone(),
+        kind: "video".into(),
+        width,
+        height,
+        frames: paths.len().min(u32::MAX as usize) as u32,
+        fps,
+    };
+    state
+        .media
+        .lock()
+        .map_err(|_| "媒体信息缓存锁定失败")?
+        .insert(playlist_path.clone(), info.clone());
+    state
+        .sequences
+        .lock()
+        .map_err(|_| "序列列表锁定失败")?
+        .insert(playlist_path.clone(), paths.clone());
+    if let Some(music) = music.filter(|m| !m.trim().is_empty()) {
+        state
+            .sequence_music
+            .lock()
+            .map_err(|_| "音乐映射锁定失败")?
+            .insert(playlist_path, music);
+    }
+    Ok(info)
 }
 
 fn rgba_png(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
@@ -1833,7 +2056,16 @@ fn export_one_video(
     on_progress: &mut dyn FnMut(u32, u32, String),
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<u32, String> {
-    let (source_w, source_h, total_frames, fps) = video_probe(path)?;
+    // 序列清单无真实视频流可探测，优先用导入时注册的缓存信息（普通视频二者一致）
+    let cached_info = state
+        .media
+        .lock()
+        .ok()
+        .and_then(|media| media.get(path).cloned());
+    let (source_w, source_h, total_frames, fps) = match cached_info {
+        Some(info) => (info.width, info.height, info.frames, info.fps),
+        None => video_probe(path)?,
+    };
     let vsr_mode = settings.upscale == "vsr";
     let (mut w, mut h) =
         sanitize_output(output_width, output_height).unwrap_or((source_w, source_h));
@@ -1897,19 +2129,38 @@ fn export_one_video(
     let result: Result<u32, String> = (|| {
         let frame_bytes = (decode_w * decode_h * 4) as usize;
         let scale_filter = format!("scale={w}:{h}:flags=lanczos");
+        let is_concat = path.to_ascii_lowercase().ends_with(".ffconcat");
         // 处理前显式归一化帧率。这样 rawvideo 的帧数与编码器的时间轴一致，
         // 同时仍按输入视频的实际时长处理可变帧率素材。
-        let decode_filter = if !bypass && (w, h) != (source_w, source_h) {
+        // 序列清单的时间基继承自图片流（1/25），fps 归一化会破坏帧时间戳；
+        // 逐帧 1:1 读取，输出时间轴完全由编码端 -r 与 -t 决定（缩放仍需在解码端完成）
+        let decode_filter = if is_concat {
+            if !bypass && (w, h) != (source_w, source_h) {
+                scale_filter.clone()
+            } else {
+                String::new()
+            }
+        } else if !bypass && (w, h) != (source_w, source_h) {
             format!("{scale_filter},fps=fps={fps}:round=near")
         } else {
             format!("fps=fps={fps}:round=near")
         };
         let mut command = tool("ffmpeg")?;
-        command.args(["-v", "error", "-i", &path]);
+        command.args(["-v", "error"]);
+        command.args(concat_input_args(path));
+        command.args(["-i", path]);
+        if !decode_filter.is_empty() {
+            command.args(["-vf", &decode_filter]);
+        }
         let mut decode = command
+            .args(concat_frame_cap(path, total_frames))
+            // 同上：passthrough 防止重复 pts 的帧在输出端被丢弃
+            .args(if is_concat {
+                vec!["-vsync", "0"]
+            } else {
+                Vec::new()
+            })
             .args([
-                "-vf",
-                &decode_filter,
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -1921,6 +2172,17 @@ fn export_one_video(
             .spawn()
             .map_err(|e| format!("无法启动 FFmpeg 解码器: {e}"))?;
         // 音轨按设置附带（统一转 AAC 写入 MP4），关闭"保持音频"时输出纯视频。
+        // 图片序列的音轨来自导入时指定的音乐文件。
+        let audio_source = if settings.keep_audio {
+            state
+                .sequence_music
+                .lock()
+                .ok()
+                .and_then(|music| music.get(path).cloned())
+        } else {
+            None
+        };
+        let audio_input = audio_source.as_deref().unwrap_or(path);
         let mut encode = tool("ffmpeg")?
             .args([
                 "-y",
@@ -1937,7 +2199,7 @@ fn export_one_video(
                 "-i",
                 "-",
                 "-i",
-                &path,
+                audio_input,
                 "-map",
                 "0:v",
             ])
@@ -1954,6 +2216,15 @@ fn export_one_video(
                     "-af",
                     "apad",
                     "-shortest",
+                ]
+            } else {
+                Vec::new()
+            })
+            // -shortest 受音频包缓冲影响会越过视频结尾；序列时长精确已知，用 -t 硬性截断
+            .args(if is_concat {
+                vec![
+                    "-t".to_string(),
+                    format!("{}", out_total as f64 / out_fps),
                 ]
             } else {
                 Vec::new()
@@ -2257,7 +2528,10 @@ fn choose_media_multi() -> Option<Vec<String>> {
 #[tauri::command]
 fn choose_images_multi() -> Option<Vec<String>> {
     rfd::FileDialog::new()
-        .add_filter("图片", &["png", "jpg", "jpeg", "webp", "bmp"])
+        .add_filter(
+            "图片",
+            &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+        )
         .pick_files()
         .map(|paths| {
             paths
@@ -2288,6 +2562,18 @@ fn unique_image_destination(dir: String, stem: String) -> Result<String, String>
 fn choose_directory() -> Option<String> {
     rfd::FileDialog::new()
         .pick_folder()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+// 选择音乐文件（图片序列导出时的音轨）
+#[tauri::command]
+fn choose_music() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter(
+            "音频",
+            &["mp3", "wav", "aac", "flac", "m4a", "ogg", "wma"],
+        )
+        .pick_file()
         .map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -2570,6 +2856,9 @@ fn main() {
                 rife_disabled: AtomicBool::new(false),
                 interp_cache: Mutex::new(None),
                 media: Mutex::new(HashMap::new()),
+                sequences: Mutex::new(HashMap::new()),
+                sequence_frames: Mutex::new(VecDeque::new()),
+                sequence_music: Mutex::new(HashMap::new()),
                 decoder: Mutex::new(None),
                 temp_counter: AtomicU64::new(0),
                 gpu: detect_gpu_info(),
@@ -2610,6 +2899,8 @@ fn main() {
             batch_cancel,
             choose_media_multi,
             choose_images_multi,
+            load_image_sequence,
+            choose_music,
             unique_image_destination,
             choose_directory,
             vsr_probe

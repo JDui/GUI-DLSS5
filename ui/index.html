@@ -13,6 +13,7 @@
       <b data-i18n="import.media">素材</b>
       <button id="open" class="primary" data-i18n="import.open">＋ 导入图片 / 视频</button>
       <button id="paste" data-i18n="import.paste">粘贴图片</button>
+      <button id="seq-open" data-i18n="import.sequence">＋ 导入图片序列</button>
       <button id="batch-open" data-i18n="footer.batch">批量处理</button>
       <div class="runtime">
         <label data-i18n="gpu.label">显卡</label>
@@ -286,6 +287,34 @@
         <span class="batch-flex"></span>
         <button id="batch-cancel" hidden data-i18n="batch.cancel">取消</button>
         <button id="batch-start" class="primary" data-i18n="batch.start">开始导出</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="seq-modal" hidden>
+    <div class="batch-panel">
+      <div class="batch-head">
+        <b data-i18n="seq.title">导入图片序列</b>
+        <button id="seq-close" data-i18n-title="batch.close" title="关闭">✕</button>
+      </div>
+      <div class="batch-toolbar">
+        <button id="seq-add" class="primary" data-i18n="seq.add">＋ 添加图片</button>
+        <button id="seq-sort" data-i18n="seq.sort">智能排序</button>
+        <span id="seq-hint" class="batch-hint" data-i18n="seq.hint">按列表顺序合成为视频；支持 png / jpg / webp / bmp / tif，可多选</span>
+      </div>
+      <div id="seq-list"><div class="batch-empty" data-i18n="seq.empty">尚未选择图片</div></div>
+      <div class="batch-foot">
+        <label class="seq-fps"><span data-i18n="seq.fps">帧率</span>
+          <input id="seq-fps" type="number" min="1" max="240" step="1" value="60"/>
+        </label>
+        <label class="seq-music"><span data-i18n="seq.music">音乐</span>
+          <input id="seq-music-path" type="text" readonly data-i18n-placeholder="seq.musicPlaceholder" placeholder="未选择"/>
+          <button id="seq-music-pick" data-i18n="seq.musicPick">选择…</button>
+          <button id="seq-music-clear" data-i18n-title="seq.musicClear" title="清除音乐">✕</button>
+        </label>
+        <span class="batch-flex"></span>
+        <button id="seq-cancel" data-i18n="seq.cancel">取消</button>
+        <button id="seq-ok" class="primary" data-i18n="seq.ok">确定</button>
       </div>
     </div>
   </div>

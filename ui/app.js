@@ -21,6 +21,15 @@ function log(message) { console.debug(`[DLSS5] ${message}`); }
 let currentStatus = () => t('status.ready');
 function status(message) { currentStatus = typeof message === 'function' ? message : () => message; $('status').textContent = currentStatus(); }
 function statusT(key, variables) { status(() => t(key, variables)); }
+// 上一次预览整个 flow 的耗时（前端墙钟），用于就绪状态展示与整片渲染 ETA 估算
+let lastPreviewMs = 0;
+// 预览完成后的就绪状态：附带上次预览耗时；视频额外给出整片渲染 ETA 估算（单帧耗时 × 总帧数）
+function statusReady() {
+  const frames = state.kind==='video' ? Math.max(1, state.info?.frames||1) : 1;
+  if(lastPreviewMs>0&&frames>1) statusT('status.readyStats',{elapsed:fmtDuration(lastPreviewMs),eta:fmtEtaCompact(lastPreviewMs/1000*frames)});
+  else if(lastPreviewMs>0) statusT('status.readyElapsed',{elapsed:fmtDuration(lastPreviewMs)});
+  else statusT('status.ready');
+}
 async function invokePng(cmd, args) { const res = await invoke(cmd, args); const bytes = res instanceof Uint8Array ? res : new Uint8Array(res); return URL.createObjectURL(new Blob([bytes], { type:'image/png' })); }
 async function urlToDataUri(url) { const blob = await (await fetch(url)).blob(); return new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(blob); }); }
 // 延迟回收：导出/复制会异步加载正在显示的 URL，立即回收会中断在途加载
@@ -215,7 +224,19 @@ async function loadPath(path) {
   state.request++;
   refreshQueued=false;
   refreshQueuedFit=false;
-  const info=await invoke('media_info',{path}); revokeMedia(); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,sourceData:null,splitX:null,loadedFrame:-1});
+  const info=await invoke('media_info',{path});
+  await loadInfo(info,path);
+}
+// 载入已探测的媒体信息（media_info / load_image_sequence 的返回值），displayName 用于素材标签
+async function loadInfo(info,displayName) {
+  await runtimeReady;
+  stopPlayback();
+  statusT('status.reading');
+  clearTimeout(refreshTimer);
+  state.request++;
+  refreshQueued=false;
+  refreshQueuedFit=false;
+  revokeMedia(); Object.assign(state,{path:info.path,sourcePath:info.sourcePath,kind:info.kind,info,sourceData:null,splitX:null,loadedFrame:-1,sourceName:displayName.split(/[\\/]/).pop()});
   const initial=fitOutput(info.width,info.height)||[info.width,info.height];
   $('out-width').value=initial[0]; $('out-height').value=initial[1]; markRatio(); updateSizeNote(); updateInterpNote(); updateInterpAvailability(); updateTimelineVisibility();
   if(info.kind==='video') {
@@ -225,7 +246,7 @@ async function loadPath(path) {
   } else {
     state.originalUrl=await invokePng('read_image_data',{path:info.path,maxSide:PREVIEW_MAX_SIDE,...outputArgs()});
   }
-  $('source').textContent=t('source.loaded',{name:path.split(/[\\/]/).pop(),type:info.kind==='video'?t('media.video'):t('media.image'),width:info.width,height:info.height});
+  $('source').textContent=t('source.loaded',{name:displayName.split(/[\\/]/).pop(),type:info.kind==='video'?t('media.video'):t('media.image'),width:info.width,height:info.height});
   $('frame').max=Math.max(0,info.frames-1)*interpFactor(); $('frame').value=0; $('frame-label').textContent=t('frame.label',{current:0,total:$('frame').max}); $('export-full').textContent=t(info.kind==='video'?'footer.exportVideo':'footer.exportImage');
   chooseDisplayed(true);
   statusT('status.preview'); await refresh(true,0);
@@ -304,6 +325,10 @@ async function pollExportProgress() {
 }
 // 剩余时间格式化为 m:ss 或 h:mm:ss
 const fmtEta=s=>{s=Math.max(1,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}:${String(m).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`:`${m}:${String(s%60).padStart(2,'0')}`;};
+// 预览耗时：<1s 显示 ms，1–10s 显示一位小数秒，更长取整秒
+const fmtDuration=ms=>ms<1000?`${Math.round(ms)}ms`:`${(ms/1000).toFixed(ms<10000?1:0)}s`;
+// ETA 紧凑格式：50s / 2m30s / 1h23m
+const fmtEtaCompact=s=>{s=Math.max(1,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h${m}m`:m?`${m}m${s%60}s`:`${s}s`;};
 setInterval(pollExportProgress,120);
 pollExportProgress();
 function setExportBusy(busy) { exportBusy=busy; exportButtons.forEach(button=>button.disabled=busy); $('export-pause').hidden=!busy; $('export-cancel').hidden=!busy; if(!busy){exportPaused=false;$('export-pause').textContent=t('progress.pause');} }
@@ -341,6 +366,7 @@ function refresh(fit=false, delay=90) {
     const renderFit=refreshQueuedFit;
     refreshQueuedFit=false;
     try {
+      const previewStartedAt=performance.now();
       // 播放中不刷新右下角状态，避免反复闪烁
       if(playHandle===null)statusT('status.refreshPreview');
       let processedUrl, originalUrl;
@@ -364,13 +390,14 @@ function refresh(fit=false, delay=90) {
         deferRevoke(state.processedUrl);
         state.processedUrl=processedUrl;
         chooseDisplayed(renderFit);
-        if(playHandle===null)statusT('status.ready');
+        lastPreviewMs=performance.now()-previewStartedAt;
+        if(playHandle===null)statusReady();
       } else {
         URL.revokeObjectURL(processedUrl);
         if(originalUrl)URL.revokeObjectURL(originalUrl);
       }
     } catch(e) {
-      if(request===state.request&&renderPath===state.path){log(`DLSS: ${e}`);statusT('status.previewFailed');}
+      if(request===state.request&&renderPath===state.path){log(`DLSS: ${e}`);statusT('status.previewFailedDetail',{error:String(e)});}
     } finally {
       state.busy=false;
       const rerender=refreshQueued;
@@ -664,13 +691,84 @@ $('batch-cancel').onclick = () => {
   statusT('status.cancelBatch');
 };
 
+// ===== 导入图片序列：写 .ffconcat 清单注册为虚拟视频，全程直接读取原始图片 =====
+let seqRows = [];
+let seqMusic = '';
+const seqModal = $('seq-modal');
+const seqNameOf = p => p.substring(Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/')) + 1);
+function renderSeqRows() {
+  const list = $('seq-list');
+  list.innerHTML = '';
+  if (!seqRows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'batch-empty';
+    empty.textContent = t('seq.empty');
+    list.appendChild(empty);
+    return;
+  }
+  seqRows.forEach((r, i) => {
+    const row = document.createElement('div');
+    row.className = 'seq-row';
+    const name = document.createElement('span');
+    name.className = 'row-name';
+    name.textContent = `${i + 1}. ${r.name}`;
+    name.title = r.path;
+    const remove = document.createElement('button');
+    remove.textContent = '✕';
+    remove.title = t('seq.remove');
+    remove.onclick = () => { seqRows.splice(i, 1); renderSeqRows(); };
+    row.append(name, remove);
+    list.appendChild(row);
+  });
+}
+$('seq-open').onclick = () => { seqRows = []; seqMusic = ''; $('seq-music-path').value = ''; $('seq-fps').value = 60; renderSeqRows(); seqModal.hidden = false; };
+$('seq-close').onclick = $('seq-cancel').onclick = () => { seqModal.hidden = true; };
+$('seq-add').onclick = async () => {
+  try {
+    const paths = await invoke('choose_images_multi');
+    if (!paths) return;
+    for (const p of paths) {
+      if (!seqRows.some(r => r.path === p)) seqRows.push({ path: p, name: seqNameOf(p) });
+    }
+    renderSeqRows();
+  } catch (e) { log(`图片序列: ${e}`); }
+};
+// 智能排序：按文件名自然排序（数字按数值比较，img2 排在 img10 之前）
+$('seq-sort').onclick = () => {
+  seqRows.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+  renderSeqRows();
+};
+$('seq-music-pick').onclick = async () => {
+  try {
+    const music = await invoke('choose_music');
+    if (music) { seqMusic = music; $('seq-music-path').value = music; }
+  } catch (e) { log(`图片序列: ${e}`); }
+};
+$('seq-music-clear').onclick = () => { seqMusic = ''; $('seq-music-path').value = ''; };
+$('seq-ok').onclick = async () => {
+  if (!seqRows.length) return;
+  const fps = Math.max(1, Math.min(240, +$('seq-fps').value || 60));
+  const ok = $('seq-ok');
+  ok.disabled = true;
+  try {
+    statusT('status.bakingSequence');
+    const info = await invoke('load_image_sequence', { paths: seqRows.map(r => r.path), fps, music: seqMusic || null });
+    seqModal.hidden = true;
+    const dir = seqRows[0].path.slice(0, Math.max(seqRows[0].path.lastIndexOf('\\'), seqRows[0].path.lastIndexOf('/')));
+    await loadInfo(info, t('seq.displayName', { folder: seqNameOf(dir) || seqNameOf(seqRows[0].path), count: seqRows.length }));
+  } catch (e) {
+    log(`图片序列: ${e}`);
+    statusT('status.bakeSequenceFailedDetail', { error: String(e) });
+  } finally { ok.disabled = false; }
+};
+
 function refreshLocalizedUi() {
   $('out-width').parentElement.title = t('output.customTitle', {maxSide:PREVIEW_MAX_SIDE});
   $('gpu-name').textContent = $('gpu-name').dataset.detectedName || ($('gpu-name').classList.contains('unavailable') ? t('gpu.notDetected') : t('gpu.detecting'));
   $('source').textContent = state.path && state.info
     ? (state.kind === 'clipboard'
       ? t('source.pasted')
-      : t('source.loaded',{name:state.path.split(/[\\/]/).pop(),type:state.kind==='video'?t('media.video'):t('media.image'),width:state.info.width,height:state.info.height}))
+      : t('source.loaded',{name:state.sourceName||state.path.split(/[\\/]/).pop(),type:state.kind==='video'?t('media.video'):t('media.image'),width:state.info.width,height:state.info.height}))
     : t('source.empty');
   $('frame-label').textContent=t('frame.label',{current:$('frame').value,total:$('frame').max});
   $('export-full').textContent=state.kind==='video'?t('footer.exportVideo'):(state.kind?t('footer.exportImage'):t('footer.exportVideo'));
