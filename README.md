@@ -14,6 +14,9 @@
 Windows x64 发布包，解压后运行 `run.bat` 即可。发布包已携带程序、DLSS 运行时以及视频处理所需
 的 FFmpeg / FFprobe。目前支持 NVIDIA GeForce RTX 50 / 40 / 30 系列显卡。
 
+> 注意：图片序列导入并直接导出视频功能目前只在仓库源码的 `main` 分支中，尚未进入 Releases
+> 发布包。如需使用，请拉取项目并按下文步骤自行构建运行。
+
 ## 构建
 
 ```powershell

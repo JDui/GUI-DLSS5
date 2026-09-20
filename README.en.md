@@ -15,6 +15,10 @@ No compilation is required for normal use. Download the latest Windows x64 packa
 The package includes the application, DLSS runtimes, FFmpeg, and FFprobe. NVIDIA GeForce
 RTX 50, 40, and 30 series GPUs are supported.
 
+> Note: Image-sequence import and direct video export are currently available only from the
+> repository's `main` branch and are not included in the Releases package. Clone the project
+> and build it with the steps below if you need this feature.
+
 ## Build
 
 ```powershell
