@@ -18,7 +18,7 @@ use std::{
     process::{Child, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
 };
 use tauri::{ipc::Response, Manager};
@@ -423,7 +423,7 @@ struct AppState {
     interp_cache: Mutex<Option<InterpCache>>,
     media: Mutex<HashMap<String, MediaInfo>>,
     // 图片序列清单路径 → 有序图片文件列表（预览直接按帧号读取对应文件）
-    sequences: Mutex<HashMap<String, Vec<String>>>,
+    sequences: Mutex<HashMap<String, Arc<Vec<String>>>>,
     // 序列帧直接解码缓存：(清单路径, 帧号) → (宽, 高, 原始分辨率 RGBA)
     sequence_frames: Mutex<VecDeque<((String, u32), (u32, u32, Vec<u8>))>>,
     // 图片序列的音轨映射：清单路径 → 导出时混入的音乐文件
@@ -1091,6 +1091,7 @@ fn decode_sequence_frame(
     target: Option<(u32, u32)>,
     vsr_mode: bool,
 ) -> Option<Result<(Vec<u8>, u32, u32), String>> {
+    // 预览的每一帧都会经过这里。只增加 Arc 引用计数，避免长序列重复复制整份路径列表。
     let paths = state.sequences.lock().ok()?.get(path).cloned()?;
     Some(decode_sequence_frame_inner(
         state, path, paths, frame, max_side, target, vsr_mode,
@@ -1100,7 +1101,7 @@ fn decode_sequence_frame(
 fn decode_sequence_frame_inner(
     state: &AppState,
     playlist: &str,
-    paths: Vec<String>,
+    paths: Arc<Vec<String>>,
     frame: u32,
     max_side: u32,
     target: Option<(u32, u32)>,
@@ -1387,7 +1388,7 @@ async fn load_image_sequence(
         .sequences
         .lock()
         .map_err(|_| "序列列表锁定失败")?
-        .insert(playlist_path.clone(), paths.clone());
+        .insert(playlist_path.clone(), Arc::new(paths));
     if let Some(music) = music.filter(|m| !m.trim().is_empty()) {
         state
             .sequence_music

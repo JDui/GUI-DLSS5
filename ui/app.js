@@ -23,9 +23,15 @@ function status(message) { currentStatus = typeof message === 'function' ? messa
 function statusT(key, variables) { status(() => t(key, variables)); }
 // 上一次预览整个 flow 的耗时（前端墙钟），用于就绪状态展示与整片渲染 ETA 估算
 let lastPreviewMs = 0;
-// 预览完成后的就绪状态：附带上次预览耗时；视频额外给出整片渲染 ETA 估算（单帧耗时 × 总帧数）
+// 导出帧数与后端 export_one_video 保持一致：插帧会额外生成并经 RIFE 处理的中间帧。
+function estimatedOutputFrames() {
+  if (state.kind !== 'video') return 1;
+  const inputFrames = Math.max(1, state.info?.frames || 1);
+  return (inputFrames - 1) * Math.max(1, interpFactor()) + 1;
+}
+// 预览完成后的就绪状态：以完整预览耗时作为每个输出帧的保守成本，避免插帧时漏算 RIFE 中间帧。
 function statusReady() {
-  const frames = state.kind==='video' ? Math.max(1, state.info?.frames||1) : 1;
+  const frames = estimatedOutputFrames();
   if(lastPreviewMs>0&&frames>1) statusT('status.readyStats',{elapsed:fmtDuration(lastPreviewMs),eta:fmtEtaCompact(lastPreviewMs/1000*frames)});
   else if(lastPreviewMs>0) statusT('status.readyElapsed',{elapsed:fmtDuration(lastPreviewMs)});
   else statusT('status.ready');
